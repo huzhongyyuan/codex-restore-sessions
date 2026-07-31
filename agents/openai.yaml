@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Session Guard"
+  short_description: "Audit and preserve sessions across provider switches"
+  default_prompt: "Use $codex-restore-sessions to audit and preserve my local Codex sessions before or after a provider switch."
