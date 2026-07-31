@@ -5,7 +5,8 @@ description: Quickly audit and restore local Codex sessions after provider, rela
 
 # Restore Codex Sessions
 
-Use `scripts/session_guard.py`. It uses only Python's standard library and never handles credentials.
+Use Python 3.10+ with `scripts/session_guard.py`. Python 3.10 needs `tomli` from
+`requirements.txt`; Python 3.11+ uses only the standard library. Never handle credentials.
 
 ## Fast Local Restore
 

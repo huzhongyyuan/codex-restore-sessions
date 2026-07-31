@@ -30,12 +30,19 @@ JSONL 不一致等问题。
 
 ## 安装
 
-需要 Python 3.11+。Linux 和 macOS 支持审计与修改；Windows 当前仅支持审计，因为修改路径依赖
-`fcntl` 文件锁。
+需要 Python 3.10+。Python 3.11+ 无额外依赖；Python 3.10 需安装 `tomli`。Linux 和 macOS
+支持审计与修改；Windows 当前仅支持审计，因为修改路径依赖 `fcntl` 文件锁。
 
 ```bash
 git clone https://github.com/huzhongyyuan/codex-restore-sessions.git \
   "${CODEX_HOME:-$HOME/.codex}/skills/codex-restore-sessions"
+```
+
+仅使用 Python 3.10 时，再运行：
+
+```bash
+python3 -m pip install -r \
+  "${CODEX_HOME:-$HOME/.codex}/skills/codex-restore-sessions/requirements.txt"
 ```
 
 重启 Codex 后，可直接说：

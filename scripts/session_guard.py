@@ -14,10 +14,14 @@ import re
 import shutil
 import sqlite3
 import tempfile
-import tomllib
 import urllib.parse
 from collections import Counter
 from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib
 
 try:
     import fcntl
