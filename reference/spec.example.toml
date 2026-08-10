@@ -1,0 +1,84 @@
+# Target host description for codex-provision-host.
+#
+# Copy, edit, keep somewhere convenient (it holds no secrets — only paths).
+#   python3 scripts/provision_codex.py plan  --spec my-host.toml
+#   python3 scripts/provision_codex.py apply --spec my-host.toml
+
+# Where Codex data lives. "~" expands. If this is NOT "$HOME/.codex", the tool
+# offers to symlink "$HOME/.codex" -> here so the VS Code extension finds it
+# (the extension host never sees a CODEX_HOME exported from .bashrc).
+codex_home = "~/.codex"
+
+# Provider id that every profile shares so the resume picker shows one list.
+# Must NOT be "openai" (reserved, cannot be overridden).
+shared_provider_id = "shared"
+
+# Default permission level, written to the base config and inherited by all
+# profiles. Omit either key to leave the current value untouched.
+#
+#   approval_policy: "untrusted" | "on-failure" | "on-request" | "never"
+#   sandbox_mode:    "read-only" | "workspace-write" | "danger-full-access"
+#
+# "never" + "danger-full-access" is full access: no prompts, no sandbox, so
+# Codex-generated commands can read and write anything the user can, including
+# ~/.ssh and key files. Use "workspace-write" to stop the prompts while keeping
+# writes inside the working directory.
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+
+# Mark the primary working directory trusted so Codex does not re-ask.
+trusted_projects = ["~"]
+
+# ---------------------------------------------------------------------------
+# The official ChatGPT channel (plain `codex`, no -p).
+#
+# Give it the shared id too, otherwise its history is invisible to the
+# profiles. A custom id keeps OAuth as long as base_url is the official
+# backend and requires_openai_auth = true; auth still reads auth.json.
+# Omit this whole section to leave the base config's provider alone.
+# ---------------------------------------------------------------------------
+[official]
+model = "gpt-5.6-sol"
+model_reasoning_effort = "high"
+
+# ---------------------------------------------------------------------------
+# One block per relay / gateway. Each becomes:
+#   $CODEX_HOME/<id>.config.toml   ->  codex -p <id>
+#   a codex-<id>() shell wrapper   ->  codex-<id>
+# ---------------------------------------------------------------------------
+
+[[providers]]
+id = "relay"
+name = "my-relay"                                   # cosmetic label only
+base_url = "https://relay.example.com/v1"
+wire_api = "responses"
+env_key = "RELAY_KEY"                          # env var the wrapper injects
+key_file = "~/.codex-providers/relay/auth.json"
+key_json_field = "OPENAI_API_KEY"
+model = "gpt-5.6-sol"
+model_reasoning_effort = "high"
+# Relays commonly need this true to be accepted as a Codex backend. It makes
+# the banner show the official account and weekly-limit bar; those numbers are
+# official-account values and unrelated to the relay.
+requires_openai_auth = true
+
+[[providers]]
+id = "gateway"
+name = "my-gateway"
+base_url = "https://gateway.example.net"
+wire_api = "responses"
+env_key = "GATEWAY_KEY"
+key_file = "~/.codex-providers/gateway/auth.json"
+key_json_field = "OPENAI_API_KEY"
+model = "gpt-5.6-luna"
+requires_openai_auth = true
+
+# Each key_file must be JSON, mode 0600, created by hand:
+#   mkdir -p ~/.codex-providers/relay
+#   umask 077
+#   printf '{"OPENAI_API_KEY": "<key>"}\n' > ~/.codex-providers/relay/auth.json
+#
+# The tool never creates or reads these values — it only checks presence and
+# permissions. Never put a key in config.toml or .bashrc, and never export
+# CODEX_API_KEY (Codex treats it as the official key and 401s the default
+# provider).

@@ -14,6 +14,7 @@ import re
 import shutil
 import sqlite3
 import tempfile
+import time
 import urllib.parse
 from collections import Counter
 from pathlib import Path
@@ -32,6 +33,15 @@ STATE_FILE = "session_guard_state.json"
 FINGERPRINT_KEYS = ("base_url", "wire_api", "requires_openai_auth", "name")
 INCOMPLETE_STATUSES = {"prepared", "applying", "data_applied", "rolling_back"}
 MAX_METADATA_LINE = 4 * 1024 * 1024
+TRANSFER_ITEMS = ("sessions", "archived_sessions", "session_index.jsonl")
+CREDENTIAL_NAMES = {
+    "auth.json",
+    ".env",
+    "credentials.json",
+    "provider_keys.env",
+    "id_rsa",
+    "id_ed25519",
+}
 
 
 def die(message: str) -> None:
@@ -108,20 +118,89 @@ def find_db(home: Path) -> Path:
     die(f"No usable state_*.sqlite with a threads table under {home}")
 
 
-def config_target(home: Path) -> dict[str, object]:
-    path = home / "config.toml"
-    data = tomllib.loads(path.read_text()) if path.exists() else {}
+def load_toml(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return {}
+    try:
+        data = tomllib.loads(path.read_text())
+    except tomllib.TOMLDecodeError as exc:
+        die(f"Malformed TOML in {path}: {exc}")
     if not isinstance(data, dict):
-        die("config.toml root must be a table")
-    profile_name = data.get("profile")
-    profile = {}
+        die(f"TOML root must be a table: {path}")
+    return data
+
+
+def deep_merge(base: dict[str, object], overlay: dict[str, object]) -> dict[str, object]:
+    """Layer overlay onto base the way Codex layers `-p <name>.config.toml`.
+
+    Nested tables merge key by key, so a profile may override only `base_url`
+    inside `[model_providers.X]` and still inherit `wire_api` from the base file.
+    """
+    merged = dict(base)
+    for key, value in overlay.items():
+        current = merged.get(key)
+        if isinstance(current, dict) and isinstance(value, dict):
+            merged[key] = deep_merge(current, value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def profile_path(home: Path, name: str) -> Path:
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", name) or name in {".", ".."}:
+        die(f"Invalid profile name: {name}")
+    path = home / f"{name}.config.toml"
+    resolved = path.resolve()
+    if not resolved.is_relative_to(home) or path.is_symlink():
+        die(f"Profile file must be a regular file directly under the Codex home: {path}")
+    return path
+
+
+def available_profiles(home: Path) -> list[str]:
+    names = []
+    for path in sorted(home.glob("*.config.toml")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        names.append(path.name[: -len(".config.toml")])
+    return names
+
+
+def config_target(home: Path, profile_name: str | None = None) -> dict[str, object]:
+    """Resolve the effective provider identity, honouring CLI-style profiles.
+
+    Codex 0.144+ layers `$CODEX_HOME/<name>.config.toml` on top of `config.toml`
+    when invoked as `codex -p <name>`. Older releases instead used inline
+    `[profiles.<name>]` tables. Both are resolved here so the fingerprint matches
+    whichever provider the session was actually recorded under.
+    """
+    data = load_toml(home / "config.toml")
+    profile_kind = None
     if profile_name is not None:
-        profiles = data.get("profiles", {})
-        if not isinstance(profiles, dict) or not isinstance(profiles.get(profile_name), dict):
-            die(f"Selected profile is missing or invalid: {profile_name}")
-        profile = profiles[profile_name]
-    provider = profile.get("model_provider") or data.get("model_provider") or "openai"
-    model = profile.get("model") or data.get("model")
+        overlay_path = profile_path(home, profile_name)
+        if overlay_path.exists():
+            data = deep_merge(data, load_toml(overlay_path))
+            profile_kind = "file"
+        else:
+            profiles = data.get("profiles", {})
+            if not isinstance(profiles, dict) or not isinstance(profiles.get(profile_name), dict):
+                die(
+                    f"Profile not found: expected {overlay_path.name} in the Codex home "
+                    f"or a [profiles.{profile_name}] table in config.toml"
+                )
+            data = deep_merge(data, profiles[profile_name])
+            profile_kind = "inline"
+    else:
+        inline_name = data.get("profile")
+        if inline_name is not None:
+            profiles = data.get("profiles", {})
+            if not isinstance(profiles, dict) or not isinstance(profiles.get(inline_name), dict):
+                die(f"Selected profile is missing or invalid: {inline_name}")
+            data = deep_merge(data, profiles[inline_name])
+            profile_name = inline_name
+            profile_kind = "inline"
+
+    provider = data.get("model_provider") or "openai"
+    model = data.get("model")
     tables = data.get("model_providers", {})
     if not isinstance(tables, dict):
         die("model_providers must be a table")
@@ -139,13 +218,15 @@ def config_target(home: Path) -> dict[str, object]:
     fingerprint = sha256(json.dumps(identity, sort_keys=True, default=str).encode())
     return {
         "provider": provider,
-        "provider_inferred": "model_provider" not in profile and "model_provider" not in data,
+        "provider_inferred": "model_provider" not in data,
         "profile": profile_name,
+        "profile_kind": profile_kind,
         "model": model,
         "fingerprint": fingerprint,
         "approval_policy": data.get("approval_policy"),
         "sandbox_mode": data.get("sandbox_mode"),
     }
+
 
 
 def db_rows(db: Path) -> tuple[list[str], list[dict[str, object]]]:
@@ -224,7 +305,39 @@ def legacy_names(home: Path) -> dict[str, str]:
     return result
 
 
-def audit(home: Path, verbose: bool = False) -> tuple[dict[str, object], dict[str, object]]:
+def scoped_state(state: dict[str, object], profile: str | None) -> dict[str, object]:
+    """Return the last-applied record for one profile.
+
+    Each profile tracks its own fingerprint under `profiles`, so switching
+    between `codex` and `codex -p relay` does not make either look changed.
+    The unscoped top level stays authoritative for the default profile, which
+    keeps state files written by earlier versions readable.
+    """
+    if profile is None:
+        return state
+    scoped = state.get("profiles")
+    if isinstance(scoped, dict) and isinstance(scoped.get(profile), dict):
+        return scoped[profile]
+    return {}
+
+
+def merged_state(previous: dict[str, object], record: dict[str, object], profile: str | None) -> dict[str, object]:
+    if profile is None:
+        merged = dict(record)
+        existing = previous.get("profiles")
+        if isinstance(existing, dict) and existing:
+            merged["profiles"] = existing
+        return merged
+    merged = {key: value for key, value in previous.items() if key != "invalid"}
+    scoped = dict(merged.get("profiles") or {})
+    scoped[profile] = record
+    merged["profiles"] = scoped
+    return merged
+
+
+def audit(
+    home: Path, verbose: bool = False, profile: str | None = None
+) -> tuple[dict[str, object], dict[str, object]]:
     db = find_db(home)
     columns, rows = db_rows(db)
     db_paths = [str(resolve_rollout(home, str(row["rollout_path"]))) for row in rows]
@@ -282,7 +395,7 @@ def audit(home: Path, verbose: bool = False) -> tuple[dict[str, object], dict[st
         else:
             ambiguous.append({"id": row["id"], "legacy_name": old})
 
-    target = config_target(home)
+    target = config_target(home, profile)
     state_path = home / STATE_FILE
     previous = {}
     if state_path.exists():
@@ -292,6 +405,7 @@ def audit(home: Path, verbose: bool = False) -> tuple[dict[str, object], dict[st
             previous = {"invalid": True}
         if not isinstance(previous, dict):
             previous = {"invalid": True}
+    previous_scope = scoped_state(previous, target["profile"])
     ambiguous_report = [
         {"id": item["id"], "legacy_name_preview": item["legacy_name"][:160]}
         for item in ambiguous
@@ -330,8 +444,9 @@ def audit(home: Path, verbose: bool = False) -> tuple[dict[str, object], dict[st
         "ambiguous_renames_truncated": not verbose and len(ambiguous_report) > 20,
         "schema_columns": columns,
         "target": target,
-        "provider_or_relay_changed": previous.get("fingerprint") != target["fingerprint"],
-        "previous_fingerprint_known": bool(previous.get("fingerprint")),
+        "available_profiles": available_profiles(home),
+        "provider_or_relay_changed": previous_scope.get("fingerprint") != target["fingerprint"],
+        "previous_fingerprint_known": bool(previous_scope.get("fingerprint")),
     }
     context = {
         "db": db,
@@ -341,6 +456,7 @@ def audit(home: Path, verbose: bool = False) -> tuple[dict[str, object], dict[st
         "target": target,
         "rename_candidates": candidates,
         "previous_state": previous,
+        "previous_scope": previous_scope,
     }
     return report, context
 
@@ -398,8 +514,9 @@ def compact_report(report: dict[str, object]) -> dict[str, object]:
         "ambiguous_rename_count": report["ambiguous_rename_count"],
         "target": {
             key: target[key]
-            for key in ("provider", "profile", "model", "approval_policy", "sandbox_mode")
+            for key in ("provider", "profile", "profile_kind", "model", "approval_policy", "sandbox_mode")
         },
+        "available_profiles": report["available_profiles"],
         "provider_or_relay_changed": report["provider_or_relay_changed"],
         "previous_fingerprint_known": report["previous_fingerprint_known"],
     }
@@ -467,6 +584,116 @@ def changed_first_line(line: bytes, target_provider: str) -> bytes:
     return json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode() + ending
 
 
+def retarget_record(record: dict[str, object], target_provider: str) -> bool:
+    """Point every provider field in one rollout record at `target_provider`.
+
+    Codex records the provider in more than one place: the `session_meta` header
+    (which a file may repeat) and `thread_settings.model_provider_id` inside
+    `event_msg` records. Reindexing reads the latter, so rewriting only the first
+    line lets the database drift back to the old provider. Returns whether
+    anything changed.
+    """
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return False
+    changed = False
+    if record.get("type") == "session_meta" and payload.get("model_provider") != target_provider:
+        payload["model_provider"] = target_provider
+        changed = True
+    settings = payload.get("thread_settings")
+    if isinstance(settings, dict) and "model_provider_id" in settings:
+        if settings["model_provider_id"] != target_provider:
+            settings["model_provider_id"] = target_provider
+            changed = True
+    return changed
+
+
+def deep_line_changes(path: Path, target_provider: str) -> list[dict[str, object]]:
+    """Every line in one rollout file that still names another provider.
+
+    Lines are addressed by index and verified by digest at apply time, so a
+    concurrent append (which only adds lines at the end) cannot silently shift
+    the rewrite onto the wrong record.
+    """
+    changes = []
+    with path.open("rb") as stream:
+        for index, line in enumerate(stream):
+            if b"model_provider" not in line:
+                continue
+            try:
+                record = json.loads(line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if not isinstance(record, dict):
+                continue
+            if not retarget_record(record, target_provider):
+                continue
+            ending = b"\n" if line.endswith(b"\n") else b""
+            after = json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode() + ending
+            changes.append(
+                {
+                    "index": index,
+                    "before_sha256": sha256(line),
+                    "after_b64": base64.b64encode(after).decode(),
+                    "before_b64": base64.b64encode(line).decode(),
+                }
+            )
+    return changes
+
+
+def rewrite_lines(change: dict[str, object], use_after: bool) -> None:
+    """Replace individual lines of a rollout file atomically.
+
+    Mirrors `replace_first_line`: the file identity and mtime/size are checked
+    before and after the copy, every targeted line must still match its recorded
+    digest, and the result is fsynced before the rename.
+    """
+    path = Path(str(change["path"]))
+    audit_stat = tuple(change["audit_stat"])
+    stat = path.stat()
+    if use_after and (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns) != audit_stat:
+        die(f"File changed since audit: {path}")
+    lines: dict[int, tuple[str, bytes]] = {}
+    for item in change["lines"]:
+        expected = item["before_sha256"] if use_after else sha256(base64.b64decode(item["after_b64"]))
+        replacement = item["after_b64"] if use_after else item["before_b64"]
+        lines[int(item["index"])] = (expected, base64.b64decode(replacement))
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temp = Path(temp_name)
+    seen = set()
+    try:
+        with path.open("rb") as source, os.fdopen(fd, "wb") as output:
+            opened = os.fstat(source.fileno())
+            if (opened.st_dev, opened.st_ino) != (stat.st_dev, stat.st_ino):
+                die(f"File identity changed during migration: {path}")
+            for index, line in enumerate(source):
+                target = lines.get(index)
+                if target is None:
+                    output.write(line)
+                    continue
+                expected, replacement = target
+                if sha256(line) != expected:
+                    die(f"Concurrent change detected at line {index} in {path}")
+                output.write(replacement)
+                seen.add(index)
+            after_copy = os.fstat(source.fileno())
+            if (
+                after_copy.st_size != opened.st_size
+                or after_copy.st_mtime_ns != opened.st_mtime_ns
+            ):
+                die(f"Concurrent append detected in {path}")
+            output.flush()
+            os.fsync(output.fileno())
+        missing = sorted(set(lines) - seen)
+        if missing:
+            die(f"Recorded lines are missing from {path}: {missing}")
+        shutil.copystat(path, temp)
+        os.replace(temp, path)
+    except BaseException:
+        temp.unlink(missing_ok=True)
+        raise
+
+
 def create_backup(
     home: Path,
     context: dict[str, object],
@@ -500,6 +727,7 @@ def create_backup(
         "database_backup_sha256": sha256_file(backup / "state.sqlite"),
         "status": "prepared",
         "config_fingerprint_after": context["target"]["fingerprint"],
+        "profile": context["target"]["profile"],
         "state_before": (
             base64.b64encode((home / STATE_FILE).read_bytes()).decode()
             if (home / STATE_FILE).exists()
@@ -555,6 +783,39 @@ def replace_first_line(change: dict[str, object], use_after: bool) -> None:
         temp.unlink(missing_ok=True)
 
 
+def live_rollouts(context: dict[str, object], settle_seconds: float = 2.0) -> set[str]:
+    """Rollout files still being appended to by a running Codex session.
+
+    A live session holds an open fd and appends as the turn progresses. Rewriting
+    the first line goes through a temp file plus rename, so any append that lands
+    between the audit stat and the rename is lost. Sample twice and treat anything
+    that moves -- or that already drifted from the audit stat -- as live.
+    """
+    first: dict[str, tuple[int, int]] = {}
+    for path_string, (_, _, audit_stat) in context["metadata"].items():
+        try:
+            stat = Path(path_string).stat()
+        except OSError:
+            continue
+        if (stat.st_size, stat.st_mtime_ns) != (audit_stat[2], audit_stat[3]):
+            first[path_string] = (-1, -1)
+        else:
+            first[path_string] = (stat.st_size, stat.st_mtime_ns)
+    time.sleep(settle_seconds)
+    live = set()
+    for path_string, sample in first.items():
+        if sample == (-1, -1):
+            live.add(path_string)
+            continue
+        try:
+            stat = Path(path_string).stat()
+        except OSError:
+            continue
+        if (stat.st_size, stat.st_mtime_ns) != sample:
+            live.add(path_string)
+    return live
+
+
 def apply_changes(
     home: Path,
     context: dict[str, object],
@@ -562,12 +823,22 @@ def apply_changes(
     model: str | None,
     do_renames: bool,
     operation: str,
+    skip_paths: set[str] | None = None,
+    deep: bool = False,
 ) -> Path | None:
     require_mutation_schema(context)
+    skip_paths = skip_paths or set()
+    skipped_ids = {
+        str(row["id"])
+        for row in context["rows"]
+        if str(resolve_rollout(home, str(row["rollout_path"]))) in skip_paths
+    }
     rows: list[dict[str, object]] = context["rows"]
     candidates = {item["id"]: item["name"] for item in context["rename_candidates"]} if do_renames else {}
     row_changes = []
     for row in rows:
+        if str(row["id"]) in skipped_ids:
+            continue
         after = {
             "model_provider": provider if provider is not None else row.get("model_provider"),
             "model": model if model is not None else row.get("model"),
@@ -578,8 +849,24 @@ def apply_changes(
             row_changes.append({"id": row["id"], "before": before, "after": after})
 
     file_changes = []
+    deep_changes = []
     if provider is not None:
         for path_string, (line, record, audit_stat) in context["metadata"].items():
+            if path_string in skip_paths:
+                continue
+            if deep:
+                # In deep mode every provider-bearing line is handled together, so the
+                # first line is covered here too rather than by `file_changes`.
+                lines = deep_line_changes(Path(path_string), provider)
+                if lines:
+                    deep_changes.append(
+                        {
+                            "path": path_string,
+                            "audit_stat": list(audit_stat),
+                            "lines": lines,
+                        }
+                    )
+                continue
             if record["payload"].get("model_provider") == provider:
                 continue
             after = changed_first_line(line, provider)
@@ -592,18 +879,26 @@ def apply_changes(
                 }
             )
     applied_fingerprint = context["target"]["fingerprint"]
-    state = {
+    profile = context["target"]["profile"]
+    record = {
         "fingerprint": applied_fingerprint,
         "provider": provider or context["target"]["provider"],
         "model": model or context["target"]["model"],
         "applied_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
+    if skip_paths:
+        # Deferred sessions are still on the old provider, so this run did not finish
+        # the migration. Record the count so the next run is not mistaken for a no-op.
+        record["deferred_live_sessions"] = len(skip_paths)
+    if deep:
+        record["deep"] = True
+    state = merged_state(context["previous_state"], record, profile)
     state_bytes = (json.dumps(state, ensure_ascii=False, indent=2) + "\n").encode()
     state_needs_change = (
         operation == "switch"
-        and context["previous_state"].get("fingerprint") != applied_fingerprint
+        and context["previous_scope"].get("fingerprint") != applied_fingerprint
     )
-    if not row_changes and not file_changes and not state_needs_change:
+    if not row_changes and not file_changes and not deep_changes and not state_needs_change:
         return None
 
     backup, manifest = create_backup(
@@ -614,10 +909,13 @@ def apply_changes(
         operation,
         state_bytes if operation == "switch" else None,
     )
+    if deep_changes:
+        manifest["deep_changes"] = deep_changes
     manifest["status"] = "applying"
     write_json(backup / "manifest.json", manifest)
     con = sqlite3.connect(context["db"], timeout=5)
     changed_files: list[dict[str, object]] = []
+    changed_deep: list[dict[str, object]] = []
     try:
         con.execute("begin immediate")
         for change in row_changes:
@@ -639,12 +937,17 @@ def apply_changes(
         for change in file_changes:
             replace_first_line(change, True)
             changed_files.append(change)
+        for change in deep_changes:
+            rewrite_lines(change, True)
+            changed_deep.append(change)
         verify_protected_fields(con, rows, context["columns"])
         if con.execute("pragma integrity_check").fetchone()[0] != "ok":
             die("Post-update database integrity_check failed")
         con.commit()
     except BaseException:
         con.rollback()
+        for change in reversed(changed_deep):
+            rewrite_lines(change, False)
         for change in reversed(changed_files):
             replace_first_line(change, False)
         raise
@@ -686,25 +989,36 @@ def rollback(home: Path, backup: Path) -> None:
     ):
         die("Database backup hash mismatch")
     if manifest.get("operation") == "switch":
-        current_fingerprint = config_target(home)["fingerprint"]
+        current_fingerprint = config_target(home, manifest.get("profile"))["fingerprint"]
         if current_fingerprint != manifest.get("config_fingerprint_after"):
             die("Refusing rollback because effective provider/relay configuration changed")
 
-    report, context = audit(home)
+    report, context = audit(home, profile=manifest.get("profile"))
     require_clean(report, backup)
     valid_paths = set(context["metadata"])
-    for change in manifest.get("file_changes", []):
-        path = Path(change.get("path", "")).resolve()
+
+    def check_rollout_path(raw: str) -> Path:
+        path = Path(raw).resolve()
         if (
             str(path) not in valid_paths
             or not path.is_relative_to(home / "sessions")
             and not path.is_relative_to(home / "archived_sessions")
         ):
             die(f"Manifest contains an invalid rollout path: {path}")
+        return path
+
+    for change in manifest.get("file_changes", []):
+        path = check_rollout_path(change.get("path", ""))
         for side in ("before", "after"):
             line = base64.b64decode(change[side]["line_b64"])
             if sha256(line) != change[side]["sha256"]:
                 die(f"Manifest first-line hash mismatch for {path}")
+    for change in manifest.get("deep_changes", []):
+        path = check_rollout_path(change.get("path", ""))
+        for item in change.get("lines", []):
+            before = base64.b64decode(item["before_b64"])
+            if sha256(before) != item["before_sha256"]:
+                die(f"Manifest deep-line hash mismatch for {path} line {item.get('index')}")
 
     state_path = home / STATE_FILE
     state_before = (
@@ -727,6 +1041,22 @@ def rollback(home: Path, backup: Path) -> None:
     try:
         con.execute("begin immediate")
         for change in manifest.get("row_changes", []):
+            if change.get("after") is None and change.get("deleted_row") is not None:
+                deleted = change["deleted_row"]
+                columns = [key for key in deleted if key in context["columns"]]
+                if "id" not in columns or "rollout_path" not in columns:
+                    die(f"Prune manifest is missing required columns for {change['id']}")
+                existing = con.execute(
+                    "select 1 from threads where id=?", (change["id"],)
+                ).fetchone()
+                if existing:
+                    continue
+                con.execute(
+                    f"insert into threads({','.join(columns)}) "
+                    f"values({','.join('?' for _ in columns)})",
+                    tuple(deleted[key] for key in columns),
+                )
+                continue
             current = con.execute(
                 "select model_provider, model, name from threads where id=?", (change["id"],)
             ).fetchone()
@@ -751,7 +1081,44 @@ def rollback(home: Path, backup: Path) -> None:
             if current_hash != change["after"]["sha256"]:
                 die(f"Refusing rollback; rollout diverged: {path}")
             replace_first_line(change, False)
-        verify_protected_fields(con, context["rows"], context["columns"])
+        for change in manifest.get("deep_changes", []):
+            path = Path(change["path"])
+            # Restore only files still holding the post-migration content; a file already
+            # back at its recorded "before" state is left alone, and anything else means
+            # the file changed outside this tool.
+            wanted = {int(item["index"]): item for item in change["lines"]}
+            state = None
+            with path.open("rb") as stream:
+                for index, line in enumerate(stream):
+                    item = wanted.get(index)
+                    if item is None:
+                        continue
+                    digest = sha256(line)
+                    if digest == item["before_sha256"]:
+                        seen = "before"
+                    elif digest == sha256(base64.b64decode(item["after_b64"])):
+                        seen = "after"
+                    else:
+                        die(f"Refusing rollback; rollout diverged: {path} line {index}")
+                    if state is None:
+                        state = seen
+                    elif state != seen:
+                        die(f"Refusing rollback; rollout partially rewritten: {path}")
+            if state == "after":
+                rewrite_lines(change, False)
+        expected_rows = list(context["rows"])
+        restored_ids = {
+            str(change["id"])
+            for change in manifest.get("row_changes", [])
+            if change.get("after") is None and change.get("deleted_row") is not None
+        }
+        if restored_ids:
+            known = {str(row["id"]) for row in expected_rows}
+            for change in manifest.get("row_changes", []):
+                identifier = str(change["id"])
+                if identifier in restored_ids and identifier not in known:
+                    expected_rows.append(change["deleted_row"])
+        verify_protected_fields(con, expected_rows, context["columns"])
         if con.execute("pragma integrity_check").fetchone()[0] != "ok":
             die("Rollback integrity_check failed")
         con.commit()
@@ -771,17 +1138,527 @@ def rollback(home: Path, backup: Path) -> None:
     write_json(manifest_path, manifest)
 
 
+OFFICIAL_BASE_URL = "https://chatgpt.com/backend-api/codex"
+RESERVED_PROVIDER_IDS = {"openai"}
+TOP_LEVEL_PROVIDER = re.compile(
+    r"""(?m)^([ \t]*)model_provider([ \t]*=[ \t]*)("[^"\n]*"|'[^'\n]*')([ \t]*)(\#.*)?$"""
+)
+
+
+def config_files(home: Path) -> list[Path]:
+    """The base config plus every `-p <name>` profile overlay, in apply order."""
+    files = []
+    base = home / "config.toml"
+    if base.is_file() and not base.is_symlink():
+        files.append(base)
+    for name in available_profiles(home):
+        files.append(profile_path(home, name))
+    return files
+
+
+def insert_top_level(source: str, line: str) -> str:
+    """Add a root-level key before the first table header.
+
+    Appending at the end would land the key inside whatever `[table]` comes last,
+    silently turning `model_provider` into a child of e.g. `[projects."/path"]`.
+    """
+    match = re.search(r"(?m)^\[", source)
+    if match is None:
+        prefix = source if not source or source.endswith("\n") else source + "\n"
+        return prefix + line + "\n"
+    return source[: match.start()] + line + "\n\n" + source[match.start() :]
+
+
+def unified_config(source: str, target: str) -> tuple[str, list[str]]:
+    """Rewrite one config file so its provider id becomes `target`.
+
+    Only the provider identity changes: the `[model_providers.X]` body keeps its
+    `base_url`, `env_key`, `name` and everything else, so each channel still talks
+    to its own endpoint with its own credential variable. A file that declares no
+    provider table gets one equivalent to the built-in `openai` provider, which
+    keeps authenticating through `auth.json`.
+    """
+    old_ids = [
+        match.group(1)
+        for match in re.finditer(r"(?m)^\[model_providers\.([A-Za-z0-9._-]+)\]", source)
+    ]
+    result, replaced = TOP_LEVEL_PROVIDER.subn(
+        lambda m: f'{m.group(1)}model_provider{m.group(2)}"{target}"{m.group(4) or ""}{m.group(5) or ""}',
+        source,
+    )
+    for old in old_ids:
+        if old == target:
+            continue
+        result = re.sub(
+            r"(?m)^\[model_providers\." + re.escape(old) + r"\]$",
+            f"[model_providers.{target}]",
+            result,
+        )
+    if replaced == 0:
+        result = insert_top_level(result, f'model_provider = "{target}"')
+    if not old_ids:
+        # No provider table at all means this file relied on the built-in `openai`
+        # provider. Recreate it under the shared id so the official channel joins
+        # the same session pool.
+        result = result.rstrip("\n") + (
+            f"\n\n[model_providers.{target}]\n"
+            'name = "OpenAI"\n'
+            f'base_url = "{OFFICIAL_BASE_URL}"\n'
+            'wire_api = "responses"\n'
+            "requires_openai_auth = true\n"
+        )
+    return result, old_ids
+
+
+def unify(home: Path, target: str, skip_live: bool) -> dict[str, object]:
+    """Point every profile at one provider id and migrate the history to match.
+
+    The resume picker filters on `threads.model_provider` and compares only the id,
+    so profiles keep separate session lists until they share an id. Rewriting the
+    configs without migrating the history would leave every profile at zero
+    sessions, so both halves happen here under one backup.
+    """
+    if target in RESERVED_PROVIDER_IDS:
+        die(
+            f"'{target}' is a reserved built-in provider id and cannot be shared. "
+            "Choose a custom id such as 'shared'."
+        )
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", target):
+        die(f"Invalid provider id: {target}")
+
+    targets = config_files(home)
+    if not targets:
+        die(f"No config.toml or *.config.toml found in {home}")
+
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    backup = home / "backups" / f"unify-{stamp}"
+    backup.mkdir(parents=True, mode=0o700)
+    rewrites = []
+    for path in targets:
+        original = path.read_text()
+        shutil.copy2(path, backup / path.name)
+        updated, old_ids = unified_config(original, target)
+        parsed = tomllib.loads(updated)
+        if parsed.get("model_provider") != target:
+            die(f"Rewritten config does not select the shared provider: {path}")
+        if target not in parsed.get("model_providers", {}):
+            die(f"Rewritten config has no [model_providers.{target}] table: {path}")
+        before = tomllib.loads(original)
+        for old in old_ids:
+            kept = before.get("model_providers", {}).get(old, {})
+            now = parsed["model_providers"][target]
+            for key, value in kept.items():
+                if key != "name" and now.get(key) != value:
+                    die(f"Rewrite would change {key} of [model_providers.{old}] in {path}")
+        rewrites.append(
+            {"path": str(path), "old_provider_ids": old_ids, "changed": updated != original}
+        )
+        if updated != original:
+            atomic_write(path, updated.encode(), path.stat().st_mode & 0o777)
+
+    report, context = audit(home)
+    require_clean(report)
+    skip = live_rollouts(context) if skip_live else set()
+    session_backup = apply_changes(home, context, target, None, True, "switch", skip, True)
+    after, _ = audit(home)
+    require_clean(after)
+    return {
+        "provider": target,
+        "config_backup": str(backup),
+        "configs": rewrites,
+        "session_backup": str(session_backup) if session_backup else None,
+        "deferred_live_sessions": sorted(skip),
+        "audit": after,
+    }
+
+
+def full_rows(db: Path, ids: list[str]) -> dict[str, dict[str, object]]:
+    """Read complete thread rows, including columns the audit does not track.
+
+    A prune must be able to reconstruct the row exactly, and real Codex schemas
+    carry NOT NULL columns beyond the audited subset, so the deletion snapshot
+    is taken from `select *` rather than the audit projection.
+    """
+    if not ids:
+        return {}
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    try:
+        placeholders = ",".join("?" for _ in ids)
+        rows = {}
+        for row in con.execute(f"select * from threads where id in ({placeholders})", ids):
+            record = dict(row)
+            unsupported = sorted(
+                key
+                for key, value in record.items()
+                if not isinstance(value, (str, int, float, bool, type(None)))
+            )
+            if unsupported:
+                die(
+                    "Cannot snapshot a row with non-text column types: "
+                    + ", ".join(unsupported)
+                )
+            rows[str(row["id"])] = record
+        return rows
+    finally:
+        con.close()
+
+
+def prune(home: Path, context: dict[str, object], report: dict[str, object]) -> Path | None:
+    """Delete thread rows whose rollout file no longer exists.
+
+    Codex leaves a row behind when a rollout JSONL is deleted outside the CLI.
+    Those rows make every other mode refuse to run, and no amount of provider
+    synchronisation can fix them, so removal is the only route forward. Rows are
+    only ever removed when the recorded path is absent from disk; a row whose
+    file exists is never touched, and the full database is backed up first.
+    """
+    require_mutation_schema(context)
+    stale = set(report["stale_database_paths"])
+    if not stale:
+        return None
+    rows: list[dict[str, object]] = context["rows"]
+    doomed = []
+    for row in rows:
+        path = resolve_rollout(home, str(row["rollout_path"]))
+        if str(path) not in stale:
+            continue
+        if path.exists():
+            die(f"Refusing to prune a row whose rollout file exists: {path}")
+        doomed.append(row)
+    if not doomed:
+        return None
+
+    snapshots = full_rows(Path(str(context["db"])), [str(row["id"]) for row in doomed])
+    row_changes = []
+    for row in doomed:
+        snapshot = snapshots.get(str(row["id"]))
+        if snapshot is None:
+            die(f"Could not read the full row for {row['id']}")
+        row_changes.append(
+            {
+                "id": row["id"],
+                "before": {key: row.get(key) for key in ("model_provider", "model", "name")},
+                "after": None,
+                "deleted_row": snapshot,
+            }
+        )
+    backup, manifest = create_backup(home, context, row_changes, [], "prune", None)
+    manifest["status"] = "applying"
+    write_json(backup / "manifest.json", manifest)
+    survivors = [row for row in rows if row not in doomed]
+    con = sqlite3.connect(context["db"], timeout=5)
+    try:
+        con.execute("begin immediate")
+        for row in doomed:
+            current = con.execute(
+                "select rollout_path from threads where id=?", (row["id"],)
+            ).fetchone()
+            if current is None:
+                die(f"Row vanished before prune: {row['id']}")
+            if str(current[0]) != str(row["rollout_path"]):
+                die(f"Concurrent database change detected for {row['id']}")
+            if resolve_rollout(home, str(current[0])).exists():
+                die(f"Rollout file reappeared for {row['id']}; refusing to prune")
+            con.execute("delete from threads where id=?", (row["id"],))
+        verify_protected_fields(con, survivors, context["columns"])
+        if con.execute("pragma integrity_check").fetchone()[0] != "ok":
+            die("Post-prune database integrity_check failed")
+        con.commit()
+    except BaseException:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+    manifest["status"] = "applied"
+    manifest["pruned_ids"] = [row["id"] for row in doomed]
+    write_json(backup / "manifest.json", manifest)
+    return backup
+
+
+def assert_no_credentials(names: list[str]) -> None:
+    for name in names:
+        base = Path(name).name
+        if base in CREDENTIAL_NAMES or base.startswith("auth.json"):
+            die(f"Refusing to include a credential file in a bundle: {name}")
+
+
+def export_bundle(home: Path, destination: Path, profile: str | None) -> dict[str, object]:
+    """Write a self-describing session bundle for transfer to another machine.
+
+    The bundle carries session history and a consistent database snapshot only.
+    Credentials and `config.toml` are deliberately excluded: the destination must
+    authenticate with its own keys, and copying a source `config.toml` would
+    point the new machine at a relay it may not be entitled to use.
+    """
+    report, context = audit(home, profile=profile)
+    require_clean(report)
+    if destination.exists():
+        die(f"Export destination already exists: {destination}")
+    destination.mkdir(parents=True, mode=0o700)
+    os.chmod(destination, 0o700)
+
+    payload = destination / "codex_home"
+    payload.mkdir(mode=0o700)
+    copied = []
+    for name in TRANSFER_ITEMS:
+        source = home / name
+        if not source.exists():
+            continue
+        target = payload / name
+        if source.is_dir():
+            shutil.copytree(source, target, symlinks=False, ignore_dangling_symlinks=False)
+        else:
+            shutil.copy2(source, target)
+        copied.append(name)
+    assert_no_credentials([str(path.relative_to(payload)) for path in payload.rglob("*")])
+
+    source_con = sqlite3.connect(context["db"])
+    snapshot = sqlite3.connect(destination / "state.sqlite")
+    source_con.backup(snapshot)
+    snapshot.close()
+    source_con.close()
+    os.chmod(destination / "state.sqlite", 0o600)
+    check_con = sqlite3.connect(destination / "state.sqlite")
+    check = check_con.execute("pragma integrity_check").fetchone()[0]
+    check_con.close()
+    if check != "ok":
+        die(f"Exported database integrity_check failed: {check}")
+
+    digests = {
+        str(path.relative_to(destination)): sha256_file(path)
+        for path in sorted(destination.rglob("*"))
+        if path.is_file()
+    }
+    manifest = {
+        "version": 1,
+        "kind": "session-bundle",
+        "created_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "source_codex_home": str(home),
+        "source_database": Path(str(context["db"])).name,
+        "threads": report["threads"],
+        "active": report["active"],
+        "archived": report["archived"],
+        "rollout_files": report["rollout_files"],
+        "jsonl_providers": report["jsonl_providers"],
+        "database_providers": report["database_providers"],
+        "source_provider": context["target"]["provider"],
+        "source_profile": context["target"]["profile"],
+        "included": copied,
+        "digests": digests,
+    }
+    write_json(destination / "bundle.json", manifest)
+    return {
+        "bundle": str(destination),
+        "threads": report["threads"],
+        "rollout_files": report["rollout_files"],
+        "included": copied,
+        "excluded_by_design": ["auth.json", "config.toml", "credentials", "project files"],
+    }
+
+
+def verify_bundle(bundle: Path) -> dict[str, object]:
+    manifest_path = bundle / "bundle.json"
+    if not manifest_path.is_file():
+        die(f"Not a session bundle (missing bundle.json): {bundle}")
+    manifest = json.loads(manifest_path.read_text())
+    if not isinstance(manifest, dict) or manifest.get("kind") != "session-bundle":
+        die("Unsupported or malformed bundle manifest")
+    if manifest.get("version") != 1:
+        die(f"Unsupported bundle version: {manifest.get('version')}")
+    digests = manifest.get("digests")
+    if not isinstance(digests, dict) or not digests:
+        die("Bundle manifest has no digests")
+    assert_no_credentials(list(digests))
+    for name, expected in sorted(digests.items()):
+        path = (bundle / name).resolve()
+        if not path.is_relative_to(bundle.resolve()):
+            die(f"Bundle manifest references a path outside the bundle: {name}")
+        if path.is_symlink() or not path.is_file():
+            die(f"Bundle entry is missing or not a regular file: {name}")
+        if sha256_file(path) != expected:
+            die(f"Bundle digest mismatch: {name}")
+    found = {
+        str(path.relative_to(bundle))
+        for path in bundle.rglob("*")
+        if path.is_file()
+        and path.name != "bundle.json"
+        and not path.name.endswith(("-wal", "-shm", "-journal"))
+    }
+    unexpected = sorted(found - set(digests))
+    if unexpected:
+        die("Bundle contains files absent from the manifest: " + ", ".join(unexpected[:5]))
+    snapshot = bundle / "state.sqlite"
+    # `immutable=1` keeps the check read-only in the strictest sense: opening a
+    # WAL-mode database normally creates -wal/-shm sidecars, which the file list
+    # above would then reject as unmanifested on the next run.
+    con = sqlite3.connect(f"file:{snapshot}?immutable=1", uri=True)
+    try:
+        if con.execute("pragma integrity_check").fetchone()[0] != "ok":
+            die("Bundle database integrity_check failed")
+        threads = con.execute("select count(*) from threads").fetchone()[0]
+    finally:
+        con.close()
+    return {
+        "bundle": str(bundle),
+        "verified_files": len(digests),
+        "bundle_threads": threads,
+        "manifest_threads": manifest.get("threads"),
+        "source_provider": manifest.get("source_provider"),
+        "included": manifest.get("included", []),
+    }
+
+
+def import_bundle(home: Path, bundle: Path, profile: str | None) -> dict[str, object]:
+    """Install a bundle into an empty Codex home, then sync it to local config.
+
+    Refuses a destination that already holds sessions. Merging two populated
+    homes needs schema-aware conflict resolution that this tool does not
+    implement, and a blind copy would silently drop history on one side.
+    """
+    summary = verify_bundle(bundle)
+    existing_db = sorted(home.glob("state_*.sqlite"))
+    existing_sessions = [
+        path
+        for folder in ("sessions", "archived_sessions")
+        if (home / folder).exists()
+        for path in (home / folder).rglob("rollout-*.jsonl")
+    ]
+    if existing_sessions or existing_db:
+        die(
+            "Destination Codex home already has session state "
+            f"({len(existing_sessions)} rollout files, {len(existing_db)} databases). "
+            "Refusing to merge; import only into a home without sessions."
+        )
+    manifest = json.loads((bundle / "bundle.json").read_text())
+    database_name = str(manifest.get("source_database") or "state_5.sqlite")
+    if not re.fullmatch(r"state_\d+\.sqlite", database_name):
+        die(f"Bundle records an unsafe database filename: {database_name}")
+
+    for name in manifest.get("included", []):
+        if name not in TRANSFER_ITEMS:
+            die(f"Bundle lists an unexpected transfer item: {name}")
+        source = bundle / "codex_home" / name
+        if not source.exists():
+            die(f"Bundle is missing a declared item: {name}")
+        target = home / name
+        if source.is_dir():
+            shutil.copytree(source, target, symlinks=False)
+        else:
+            shutil.copy2(source, target)
+    shutil.copy2(bundle / "state.sqlite", home / database_name)
+    os.chmod(home / database_name, 0o600)
+
+    report, context = audit(home, profile=profile)
+    foreign = [
+        row
+        for row in context["rows"]
+        if not resolve_rollout(home, str(row["rollout_path"])).is_relative_to(home)
+    ]
+    rewritten = None
+    if foreign or report["stale_database_paths"]:
+        # Imported rows carry the source machine's absolute paths. Rewrite them
+        # to this home before any other check, since nothing else can proceed
+        # while rows point outside this home.
+        rewritten = rebase_paths(home, context, manifest)
+        report, context = audit(home, profile=profile)
+    require_clean(report)
+    return {
+        "imported": summary,
+        "rebased_rows": rewritten,
+        "audit": compact_report(report),
+    }
+
+
+def rebase_paths(home: Path, context: dict[str, object], manifest: dict[str, object]) -> int:
+    """Point imported rollout_path values at this Codex home.
+
+    A row is rewritten when its recorded path lies outside this home, which is
+    the normal state right after an import. Existence on the local filesystem is
+    deliberately not the trigger: when a bundle is imported on the same machine
+    that produced it, the source paths still resolve, and leaving them alone
+    would make the new home read another home's files. The rewrite is only kept
+    when the translated path resolves to a real file inside this home, so a
+    genuinely missing session still surfaces as stale.
+    """
+    source_home = str(manifest.get("source_codex_home") or "").rstrip("/")
+    if not source_home:
+        die("Bundle does not record its source Codex home; cannot rebase paths")
+    con = sqlite3.connect(context["db"], timeout=5)
+    changed = 0
+    try:
+        con.execute("begin immediate")
+        for row in context["rows"]:
+            raw = str(row["rollout_path"])
+            current = resolve_rollout(home, raw)
+            if current.is_relative_to(home) and current.is_file():
+                continue
+            if not raw.startswith(source_home + "/"):
+                continue
+            candidate = home / raw[len(source_home) + 1 :]
+            resolved = candidate.resolve()
+            if not resolved.is_relative_to(home) or not resolved.is_file():
+                continue
+            con.execute(
+                "update threads set rollout_path=? where id=? and rollout_path=?",
+                (str(resolved), row["id"], raw),
+            )
+            changed += 1
+        verify_protected_fields(con, context["rows"], context["columns"])
+        if con.execute("pragma integrity_check").fetchone()[0] != "ok":
+            die("Post-rebase database integrity_check failed")
+        con.commit()
+    except BaseException:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+    return changed
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--codex-home")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--compact", action="store_true")
+    parser.add_argument(
+        "--profile",
+        help="Resolve the target provider through $CODEX_HOME/<name>.config.toml, "
+        "matching `codex -p <name>`",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("audit")
     switch = sub.add_parser("switch")
     switch.add_argument("--provider")
     switch.add_argument("--model", help="Explicitly rewrite historical thread model metadata")
+    switch.add_argument(
+        "--skip-live",
+        action="store_true",
+        help="Leave rollout files that a running Codex session is still appending to "
+        "untouched instead of refusing the whole migration; rerun after they exit",
+    )
+    switch.add_argument(
+        "--deep",
+        action="store_true",
+        help="Also rewrite repeated session_meta records and "
+        "thread_settings.model_provider_id, which reindexing otherwise reads to "
+        "restore the old provider",
+    )
+    unify_parser = sub.add_parser(
+        "unify",
+        help="Point config.toml and every *.config.toml at one provider id, then "
+        "deep-migrate the history so all profiles share one session list",
+    )
+    unify_parser.add_argument("--provider", default="shared")
+    unify_parser.add_argument("--skip-live", action="store_true")
     sub.add_parser("repair")
+    sub.add_parser("prune", help="Delete thread rows whose rollout file no longer exists")
+    export_parser = sub.add_parser("export", help="Write a transferable session bundle")
+    export_parser.add_argument("destination")
+    verify_parser = sub.add_parser("verify", help="Check a bundle without writing anything")
+    verify_parser.add_argument("bundle")
+    import_parser = sub.add_parser("import", help="Install a bundle into an empty Codex home")
+    import_parser.add_argument("bundle")
     rollback_parser = sub.add_parser("rollback")
     rollback_parser.add_argument("backup")
     return parser.parse_args()
@@ -790,30 +1667,75 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     home = resolve_home(args.codex_home)
+    profile = getattr(args, "profile", None)
+
+    if args.command == "verify":
+        print(json.dumps(verify_bundle(Path(args.bundle).resolve()), ensure_ascii=False, indent=2))
+        return
+
+    if args.command == "export":
+        with mutation_lock(home):
+            result = export_bundle(home, Path(args.destination).resolve(), profile)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.command == "import":
+        with mutation_lock(home):
+            result = import_bundle(home, Path(args.bundle).resolve(), profile)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
     if args.command == "rollback":
         with mutation_lock(home):
             rollback(home, Path(args.backup).resolve())
-        report, _ = audit(home, args.verbose)
+        report, _ = audit(home, args.verbose, profile)
         output = compact_report(report) if args.compact else report
         print(json.dumps({"rolled_back": args.backup, "audit": output}, ensure_ascii=False, indent=2))
         return
 
     if args.command == "audit":
-        report, _ = audit(home, args.verbose)
+        report, _ = audit(home, args.verbose, profile)
         print(json.dumps(compact_report(report) if args.compact else report, ensure_ascii=False, indent=2))
         return
+
+    if args.command == "unify":
+        with mutation_lock(home):
+            result = unify(home, args.provider, args.skip_live)
+        if args.compact:
+            result["audit"] = compact_report(result["audit"])
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
     with mutation_lock(home):
-        report, context = audit(home, args.verbose)
-        require_clean(report)
-        if args.command == "switch":
-            provider = args.provider or str(context["target"]["provider"])
-            backup = apply_changes(home, context, provider, args.model, True, "switch")
+        report, context = audit(home, args.verbose, profile)
+        skip: set[str] = set()
+        if args.command == "prune":
+            backup = prune(home, context, report)
         else:
-            backup = apply_changes(home, context, None, None, True, "repair")
-    after, _ = audit(home, args.verbose)
+            require_clean(report)
+            if args.command == "switch":
+                provider = args.provider or str(context["target"]["provider"])
+                if getattr(args, "skip_live", False):
+                    skip = live_rollouts(context)
+                backup = apply_changes(
+                    home, context, provider, args.model, True, "switch", skip, args.deep
+                )
+            else:
+                backup = apply_changes(home, context, None, None, True, "repair")
+    after, _ = audit(home, args.verbose, profile)
     require_clean(after)
     output = compact_report(after) if args.compact else after
-    print(json.dumps({"backup": str(backup) if backup else None, "audit": output}, ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            {
+                "backup": str(backup) if backup else None,
+                "deferred_live_sessions": sorted(skip),
+                "audit": output,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,1018 @@
+#!/usr/bin/env python3
+"""Provision a host's Codex install from a spec: profiles, wrappers, shared id, permissions.
+
+plan   describe every intended change, mutate nothing
+apply  perform exactly what plan listed
+verify re-derive state from the real codex binary, non-zero on drift
+
+Never handles secret values. Key files are checked for presence and mode only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]
+    except ModuleNotFoundError:
+        sys.exit("Python 3.11+, or `pip install tomli` on 3.10, is required.")
+
+OFFICIAL_BASE_URL = "https://chatgpt.com/backend-api/codex"
+RESERVED_PROVIDER_IDS = {"openai"}
+BLOCK_START = "# >>> codex-provision-host (managed block; edits here are overwritten) >>>"
+BLOCK_END = "# <<< codex-provision-host <<<"
+ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+APPROVAL_POLICIES = {"untrusted", "on-failure", "on-request", "never"}
+SANDBOX_MODES = {"read-only", "workspace-write", "danger-full-access"}
+
+# Keys accepted inside [model_providers.<id>] beyond the ones we render directly.
+# Anything else in a [[providers]] block is a typo, not config — fail loudly rather
+# than writing it into a provider table where Codex would reject the whole file.
+PROVIDER_PASSTHROUGH = {
+    "query_params",
+    "http_headers",
+    "env_http_headers",
+    "request_max_retries",
+    "stream_max_retries",
+    "stream_idle_timeout_ms",
+}
+
+# Recognised top-level spec keys, so a misplaced or misspelled one is caught.
+SPEC_KEYS = {
+    "codex_home",
+    "shared_provider_id",
+    "approval_policy",
+    "sandbox_mode",
+    "trusted_projects",
+    "bashrc",
+    "link_home",
+    "official",
+    "providers",
+}
+
+# Profile-level Codex keys (siblings of `model`, outside any table) that a spec may
+# carry verbatim into <id>.config.toml. Anything outside this set and the ones the
+# renderer emits itself is treated as a typo.
+PROFILE_PASSTHROUGH = {
+    "approvals_reviewer",
+    "service_tier",
+    "approval_policy",
+    "sandbox_mode",
+    "model_supports_reasoning_summaries",
+    "chatgpt_base_url",
+    "disable_response_storage",
+}
+
+
+def die(message: str) -> "NoReturn":  # type: ignore[valid-type]
+    sys.exit(f"error: {message}")
+
+
+def expand(raw: str) -> Path:
+    return Path(os.path.expanduser(raw)).resolve() if raw.startswith("~") else Path(raw)
+
+
+def toml_string(value: str) -> str:
+    """Quote a TOML basic string. Values here are ids/urls, never secrets."""
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def shell_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def toml_value(value: object) -> str:
+    """Render a scalar or flat list. Values here are config, never secrets."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(toml_value(v) for v in value) + "]"
+    return toml_string(str(value))
+
+
+def toml_key(key: str) -> str:
+    """Bare key when possible, quoted otherwise (e.g. "gpt-5.6-sol")."""
+    return key if re.fullmatch(r"[A-Za-z0-9_-]+", key) and not key[0].isdigit() else toml_string(key)
+
+
+def render_table(header: str, body: dict[str, object]) -> list[str]:
+    """One [header] block; nested dicts become [header.child] blocks after it."""
+    lines = ["", f"[{header}]"]
+    nested: list[str] = []
+    for key, value in body.items():
+        if isinstance(value, dict):
+            nested.extend(render_table(f"{header}.{key}", value))
+        else:
+            lines.append(f"{toml_key(key)} = {toml_value(value)}")
+    return lines + nested
+
+
+@dataclass
+class Provider:
+    ident: str
+    base_url: str
+    name: str = ""
+    wire_api: str = "responses"
+    env_key: str = ""
+    key_file: Path | None = None
+    key_json_field: str = "OPENAI_API_KEY"
+    model: str = ""
+    model_reasoning_effort: str = ""
+    model_verbosity: str = ""
+    requires_openai_auth: bool = True
+    extra: dict[str, object] = field(default_factory=dict)
+    profile_extra: dict[str, object] = field(default_factory=dict)
+    tables: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass
+class Spec:
+    codex_home: Path
+    shared_provider_id: str
+    providers: list[Provider]
+    approval_policy: str = ""
+    sandbox_mode: str = ""
+    trusted_projects: list[Path] = field(default_factory=list)
+    official: dict[str, object] = field(default_factory=dict)
+    manage_official: bool = True
+    bashrc: Path = field(default_factory=lambda: Path.home() / ".bashrc")
+    link_home: bool = True
+
+
+def load_spec(path: Path) -> Spec:
+    if not path.is_file():
+        die(f"spec not found: {path}")
+    with path.open("rb") as stream:
+        raw = tomllib.load(stream)
+
+    unknown = sorted(set(raw) - SPEC_KEYS)
+    if unknown:
+        die(
+            f"unknown top-level spec key(s): {', '.join(unknown)}. "
+            "A root-level key written after a [[providers]] block belongs to that block in TOML — "
+            "move it above the first [table]."
+        )
+
+    shared = str(raw.get("shared_provider_id", "shared"))
+    if shared in RESERVED_PROVIDER_IDS:
+        die(f"shared_provider_id {shared!r} is reserved by Codex and cannot be overridden")
+    if not ID_RE.match(shared):
+        die(f"shared_provider_id {shared!r} is not a valid TOML bare key")
+
+    home_raw = str(raw.get("codex_home") or os.environ.get("CODEX_HOME") or "~/.codex")
+    codex_home = expand(home_raw)
+
+    approval = str(raw.get("approval_policy", ""))
+    if approval and approval not in APPROVAL_POLICIES:
+        die(f"approval_policy {approval!r} must be one of {sorted(APPROVAL_POLICIES)}")
+    sandbox = str(raw.get("sandbox_mode", ""))
+    if sandbox and sandbox not in SANDBOX_MODES:
+        die(f"sandbox_mode {sandbox!r} must be one of {sorted(SANDBOX_MODES)}")
+
+    providers: list[Provider] = []
+    seen: set[str] = set()
+    for entry in raw.get("providers") or []:
+        ident = str(entry.get("id") or "")
+        if not ID_RE.match(ident):
+            die(f"provider id {ident!r} is not a valid profile name")
+        if ident in RESERVED_PROVIDER_IDS:
+            die(f"provider id {ident!r} is reserved by Codex")
+        if ident in seen:
+            die(f"duplicate provider id {ident!r}")
+        seen.add(ident)
+        base_url = str(entry.get("base_url") or "")
+        if not base_url.startswith(("http://", "https://")):
+            die(f"provider {ident}: base_url must be an http(s) URL, got {base_url!r}")
+        env_key = str(entry.get("env_key") or "")
+        if env_key and not ENV_KEY_RE.match(env_key):
+            die(f"provider {ident}: env_key {env_key!r} must be UPPER_SNAKE_CASE")
+        if env_key == "CODEX_API_KEY":
+            die(
+                f"provider {ident}: env_key must not be CODEX_API_KEY — Codex treats it as the "
+                "official key and 401s the default provider"
+            )
+        key_file = expand(str(entry["key_file"])) if entry.get("key_file") else None
+        if env_key and key_file is None:
+            die(f"provider {ident}: env_key set but no key_file to read it from")
+        known = {
+            "id", "base_url", "name", "wire_api", "env_key", "key_file", "key_json_field",
+            "model", "model_reasoning_effort", "model_verbosity", "requires_openai_auth",
+        }
+        stray = sorted(
+            set(entry) - known - PROVIDER_PASSTHROUGH - PROFILE_PASSTHROUGH - {"tables"}
+        )
+        if stray:
+            die(
+                f"provider {ident}: unrecognised key(s) {', '.join(stray)}. "
+                "In TOML a root-level key placed after [[providers]] becomes part of that block — "
+                "if one of these is meant to be a top-level spec key, move it above the first "
+                f"[table]. Provider-table keys: {', '.join(sorted(PROVIDER_PASSTHROUGH))}. "
+                f"Profile-level keys: {', '.join(sorted(PROFILE_PASSTHROUGH))}. "
+                "Use a [providers.tables.<name>] block for anything else."
+            )
+        tables = entry.get("tables") or {}
+        if not isinstance(tables, dict):
+            die(f"provider {ident}: `tables` must be a table of tables")
+        providers.append(
+            Provider(
+                ident=ident,
+                base_url=base_url,
+                name=str(entry.get("name") or ident),
+                wire_api=str(entry.get("wire_api") or "responses"),
+                env_key=env_key,
+                key_file=key_file,
+                key_json_field=str(entry.get("key_json_field") or "OPENAI_API_KEY"),
+                model=str(entry.get("model") or ""),
+                model_reasoning_effort=str(entry.get("model_reasoning_effort") or ""),
+                model_verbosity=str(entry.get("model_verbosity") or ""),
+                requires_openai_auth=bool(entry.get("requires_openai_auth", True)),
+                extra={k: v for k, v in entry.items() if k in PROVIDER_PASSTHROUGH},
+                profile_extra={k: v for k, v in entry.items() if k in PROFILE_PASSTHROUGH},
+                tables=dict(tables),
+            )
+        )
+
+    bashrc = expand(str(raw["bashrc"])) if raw.get("bashrc") else Path.home() / ".bashrc"
+    return Spec(
+        codex_home=codex_home,
+        shared_provider_id=shared,
+        providers=providers,
+        approval_policy=approval,
+        sandbox_mode=sandbox,
+        trusted_projects=[expand(str(p)) for p in (raw.get("trusted_projects") or [])],
+        official=dict(raw.get("official") or {}),
+        manage_official="official" in raw,
+        bashrc=bashrc,
+        link_home=bool(raw.get("link_home", True)),
+    )
+
+
+# --------------------------------------------------------------------------- render
+
+
+def render_profile(provider: Provider, shared: str) -> str:
+    """Build a complete <id>.config.toml. Contains no secrets — only an env var name."""
+    lines = [
+        f"# {provider.ident} profile — `codex -p {provider.ident}` or the codex-{provider.ident} wrapper.",
+        "# Written by the codex-provision-host skill; safe to edit by hand.",
+        "#",
+        f"# provider id is {shared!r}, shared with every other profile so that the resume",
+        "# picker shows one merged session list (it filters on threads.model_provider and",
+        "# compares only the id — name / base_url / auth do not participate).",
+    ]
+    if provider.env_key:
+        lines += [
+            "#",
+            f"# The key arrives as ${provider.env_key}, injected per call by the shell wrapper.",
+            "# It is never stored here and never exported globally.",
+        ]
+    lines.append("")
+    lines.append(f"model_provider = {toml_string(shared)}")
+    for key, value in (
+        ("model", provider.model),
+        ("model_reasoning_effort", provider.model_reasoning_effort),
+        ("model_verbosity", provider.model_verbosity),
+    ):
+        if value:
+            lines.append(f"{key} = {toml_string(value)}")
+    for key in sorted(provider.profile_extra):
+        lines.append(f"{key} = {toml_value(provider.profile_extra[key])}")
+    lines.append("")
+    lines.append(f"[model_providers.{shared}]")
+    lines.append(f"name = {toml_string(provider.name)}")
+    lines.append(f"base_url = {toml_string(provider.base_url)}")
+    lines.append(f"wire_api = {toml_string(provider.wire_api)}")
+    if provider.requires_openai_auth:
+        lines.append("requires_openai_auth = true")
+    if provider.env_key:
+        lines.append(f"env_key = {toml_string(provider.env_key)}")
+    inline: list[str] = []
+    tables: list[str] = []
+    for key, value in sorted(provider.extra.items()):
+        if isinstance(value, dict):
+            # e.g. http_headers / query_params: a sub-table must come after all
+            # inline keys, or it would swallow them.
+            tables.extend(render_table(f"model_providers.{shared}.{key}", value))
+        else:
+            inline.append(f"{key} = {toml_value(value)}")
+    lines.extend(inline)
+    lines.extend(tables)
+    # Free-form profile tables, e.g. [tui.model_availability_nux].
+    for name in sorted(provider.tables):
+        body = provider.tables[name]
+        if isinstance(body, dict):
+            lines.extend(render_table(name, body))
+    return "\n".join(lines) + "\n"
+
+
+def render_wrappers(spec: Spec) -> str:
+    """Shell functions that read each key at call time and scope it to one process."""
+    out = [
+        BLOCK_START,
+        "# One wrapper per Codex provider. The key is read from its 0600 file at call",
+        "# time and passed only to that single codex process — never exported, never",
+        "# written into any config. Do not set CODEX_API_KEY: Codex treats it as the",
+        "# official key and 401s the default provider.",
+    ]
+    for provider in spec.providers:
+        out.append("")
+        out.append(f"codex-{provider.ident}() {{")
+        if provider.env_key and provider.key_file is not None:
+            reader = (
+                "python3 -c "
+                + shell_quote(
+                    "import json,sys;print(json.load(open(sys.argv[1]))[sys.argv[2]])"
+                )
+                + f" {shell_quote(str(provider.key_file))}"
+                + f" {shell_quote(provider.key_json_field)}"
+            )
+            out.append(f'    local __key; __key="$({reader})" || {{')
+            out.append(
+                f'        printf "codex-{provider.ident}: cannot read key from '
+                f'{provider.key_file}\\n" >&2; return 1; }}'
+            )
+            out.append(f'    {provider.env_key}="$__key" codex -p {provider.ident} "$@"')
+        else:
+            out.append(f'    codex -p {provider.ident} "$@"')
+        out.append("}")
+    out.append(BLOCK_END)
+    return "\n".join(out) + "\n"
+
+
+# ------------------------------------------------------------------- base config edit
+
+
+TOP_LEVEL = r"""(?m)^([ \t]*){key}([ \t]*=[ \t]*)("[^"\n]*"|'[^'\n]*'|true|false)([ \t]*)(\#.*)?$"""
+
+
+def set_top_level(source: str, key: str, value: str, note: str = "") -> str:
+    """Set a root-level key, or insert it before the first [table] if absent.
+
+    Appending at end-of-file would land the key inside the last table, so an
+    absent key must be inserted above the first header.
+    """
+    rendered = f"{key} = {toml_string(value)}"
+    pattern = re.compile(TOP_LEVEL.format(key=re.escape(key)))
+    match = pattern.search(source)
+    if match is not None:
+        trailing = f"  {match.group(5)}" if match.group(5) else ""
+        return source[: match.start()] + match.group(1) + rendered + trailing + source[match.end():]
+    block = (f"{note}\n" if note else "") + rendered + "\n"
+    header = re.search(r"(?m)^\[", source)
+    if header is None:
+        prefix = source if not source or source.endswith("\n") else source + "\n"
+        return prefix + block
+    return source[: header.start()] + block + "\n" + source[header.start():]
+
+
+def strip_provider_table(source: str, provider_id: str) -> tuple[str, str]:
+    """Remove [model_providers.<id>] and return (remainder, removed_body)."""
+    pattern = re.compile(
+        r"(?ms)^\[model_providers\." + re.escape(provider_id) + r"\][ \t]*\n(.*?)(?=^\[|\Z)"
+    )
+    match = pattern.search(source)
+    if match is None:
+        return source, ""
+    return source[: match.start()] + source[match.end():], match.group(1)
+
+
+def render_base_config(source: str, spec: Spec) -> str:
+    """Apply shared id, official provider table, permissions, and trusted projects."""
+    result = source
+    shared = spec.shared_provider_id
+
+    if spec.manage_official:
+        note = (
+            "# The official channel uses the shared provider id too, so its history stays\n"
+            "# visible to every profile. A custom id keeps ChatGPT OAuth as long as base_url\n"
+            "# is the official backend and requires_openai_auth = true (auth reads auth.json).\n"
+            f"# Built-in id \"openai\" is reserved and cannot be overridden, hence {shared!r}."
+        )
+        result = set_top_level(result, "model_provider", shared, note)
+        unknown_official = sorted(
+            set(spec.official) - {"model", "model_reasoning_effort", "model_verbosity"}
+            - PROFILE_PASSTHROUGH
+        )
+        if unknown_official:
+            die(f"[official]: unrecognised key(s) {', '.join(unknown_official)}")
+        for key in ("model", "model_reasoning_effort", "model_verbosity", *sorted(PROFILE_PASSTHROUGH)):
+            if spec.official.get(key) is not None and key not in ("approval_policy", "sandbox_mode"):
+                result = set_top_level(result, key, str(spec.official[key]))
+
+        result, existing = strip_provider_table(result, shared)
+        body = existing.strip("\n")
+        if "base_url" not in body:
+            body = "\n".join(
+                [
+                    'name = "OpenAI"',
+                    f"base_url = {toml_string(OFFICIAL_BASE_URL)}",
+                    'wire_api = "responses"',
+                    "requires_openai_auth = true",
+                ]
+            )
+        table = f"[model_providers.{shared}]\n{body}\n"
+        result = result.rstrip("\n") + "\n\n" + table
+
+    if spec.approval_policy or spec.sandbox_mode:
+        note = (
+            "# Default permission level; inherited by every profile that does not\n"
+            "# override it. danger-full-access means no sandbox at all: generated\n"
+            "# commands can read and write anything the user can, including ~/.ssh\n"
+            "# and provider key files."
+        )
+        if spec.approval_policy:
+            result = set_top_level(result, "approval_policy", spec.approval_policy, note)
+            note = ""
+        if spec.sandbox_mode:
+            result = set_top_level(result, "sandbox_mode", spec.sandbox_mode, note)
+
+    for project in spec.trusted_projects:
+        header = f'[projects."{project}"]'
+        if header not in result:
+            result = result.rstrip("\n") + f"\n\n{header}\ntrust_level = \"trusted\"\n"
+
+    return result.rstrip("\n") + "\n"
+
+
+# ----------------------------------------------------------------------------- plan
+
+
+@dataclass
+class Change:
+    kind: str            # write | bashrc | symlink | migrate
+    path: str
+    reason: str
+    content: str | None = None
+    target: str | None = None
+    unchanged: bool = False
+
+
+@dataclass
+class Gap:
+    what: str
+    detail: str
+
+
+def splice_block(source: str, block: str) -> str:
+    """Replace the managed block, or append it. Never duplicates on re-run."""
+    start = source.find(BLOCK_START)
+    end = source.find(BLOCK_END)
+    if start != -1 and end != -1 and end > start:
+        tail = source[end + len(BLOCK_END):]
+        return source[:start] + block.rstrip("\n") + tail
+    prefix = source if not source or source.endswith("\n") else source + "\n"
+    if prefix and not prefix.endswith("\n\n"):
+        prefix += "\n"
+    return prefix + block
+
+
+def check_key_file(provider: Provider) -> Gap | None:
+    """Presence, JSON shape, and mode — never the value."""
+    path = provider.key_file
+    if path is None:
+        return None
+    if not path.exists():
+        return Gap(
+            f"key file missing for {provider.ident}",
+            f"create {path} as 0600 JSON: "
+            f'{{"{provider.key_json_field}": "<key>"}}  '
+            f"(mkdir -p {path.parent} && umask 077)",
+        )
+    mode = path.stat().st_mode & 0o777
+    if mode & 0o077:
+        return Gap(
+            f"key file for {provider.ident} is world/group readable",
+            f"chmod 600 {path}  (currently {mode:04o})",
+        )
+    try:
+        with path.open("rb") as stream:
+            data = json.load(stream)
+    except (OSError, json.JSONDecodeError) as exc:
+        return Gap(f"key file for {provider.ident} is not readable JSON", f"{path}: {exc}")
+    if not isinstance(data, dict) or not data.get(provider.key_json_field):
+        return Gap(
+            f"key file for {provider.ident} lacks {provider.key_json_field}",
+            f"{path} must be an object with a non-empty {provider.key_json_field}",
+        )
+    return None
+
+
+def build_plan(spec: Spec) -> tuple[list[Change], list[Gap]]:
+    changes: list[Change] = []
+    gaps: list[Gap] = []
+    home = spec.codex_home
+
+    if not home.is_dir():
+        gaps.append(
+            Gap(
+                f"codex home {home} does not exist",
+                "run codex once to create it, or create the directory before applying",
+            )
+        )
+
+    for provider in spec.providers:
+        path = home / f"{provider.ident}.config.toml"
+        desired = render_profile(provider, spec.shared_provider_id)
+        current = path.read_text() if path.is_file() else None
+        changes.append(
+            Change(
+                kind="write",
+                path=str(path),
+                reason=f"profile for `codex -p {provider.ident}` -> {provider.base_url}",
+                content=desired,
+                unchanged=current == desired,
+            )
+        )
+        gap = check_key_file(provider)
+        if gap is not None:
+            gaps.append(gap)
+
+    base = home / "config.toml"
+    base_current = base.read_text() if base.is_file() else ""
+    base_desired = render_base_config(base_current, spec)
+    reason_bits = []
+    if spec.manage_official:
+        reason_bits.append(f"official channel on shared id {spec.shared_provider_id!r}")
+    if spec.approval_policy or spec.sandbox_mode:
+        reason_bits.append(
+            f"permissions {spec.approval_policy or '(unchanged)'} / "
+            f"{spec.sandbox_mode or '(unchanged)'}"
+        )
+    if spec.trusted_projects:
+        reason_bits.append(f"{len(spec.trusted_projects)} trusted project(s)")
+    if reason_bits:
+        changes.append(
+            Change(
+                kind="write",
+                path=str(base),
+                reason="; ".join(reason_bits),
+                content=base_desired,
+                unchanged=base_desired == base_current,
+            )
+        )
+
+    if spec.providers:
+        block = render_wrappers(spec)
+        rc_current = spec.bashrc.read_text() if spec.bashrc.is_file() else ""
+        rc_desired = splice_block(rc_current, block)
+        names = ", ".join(f"codex-{p.ident}" for p in spec.providers)
+        changes.append(
+            Change(
+                kind="bashrc",
+                path=str(spec.bashrc),
+                reason=f"shell wrappers: {names}",
+                content=rc_desired,
+                unchanged=rc_desired == rc_current,
+            )
+        )
+
+    default_home = Path.home() / ".codex"
+    if spec.link_home and home != default_home:
+        if default_home.is_symlink():
+            resolved = default_home.resolve()
+            changes.append(
+                Change(
+                    kind="symlink",
+                    path=str(default_home),
+                    target=str(home),
+                    reason="VS Code extension falls back to $HOME/.codex (no login shell)",
+                    unchanged=resolved == home,
+                )
+            )
+            if resolved != home:
+                gaps.append(
+                    Gap(
+                        f"{default_home} already links elsewhere",
+                        f"points at {resolved}; remove it by hand if {home} is correct",
+                    )
+                )
+        elif default_home.exists():
+            gaps.append(
+                Gap(
+                    f"{default_home} exists and is not a symlink",
+                    "the VS Code extension will keep reading it instead of "
+                    f"{home}; move it aside by hand if that is wrong",
+                )
+            )
+        else:
+            changes.append(
+                Change(
+                    kind="symlink",
+                    path=str(default_home),
+                    target=str(home),
+                    reason="VS Code extension falls back to $HOME/.codex (no login shell)",
+                )
+            )
+
+    changes.append(
+        Change(
+            kind="migrate",
+            path=str(home),
+            reason=(
+                f"retarget existing sessions to {spec.shared_provider_id!r} with --deep so all "
+                "three provider fields per rollout are rewritten"
+            ),
+        )
+    )
+    return changes, gaps
+
+
+# ---------------------------------------------------------------------------- apply
+
+
+def backup_dir(home: Path) -> Path:
+    stamp = time.strftime("%Y%m%dT%H%M%S")
+    path = home / "backups" / f"provision-{stamp}"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def atomic_write(path: Path, content: str, mode: int | None = None) -> None:
+    tmp = path.with_name(path.name + ".provision.tmp")
+    tmp.write_text(content)
+    if mode is None:
+        mode = (path.stat().st_mode & 0o777) if path.exists() else 0o644
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def validate_toml(path: Path) -> None:
+    with path.open("rb") as stream:
+        tomllib.load(stream)
+
+
+def find_migrator(explicit: str | None) -> Path | None:
+    """Locate session_guard.py, which owns history migration."""
+    if explicit:
+        candidate = expand(explicit)
+        return candidate if candidate.is_file() else None
+    here = Path(__file__).resolve()
+    candidates = [
+        # Same scripts/ directory: both live in one skill.
+        here.parent / "session_guard.py",
+        # Installed as a separate sibling skill.
+        here.parent.parent.parent / "codex-restore-sessions" / "scripts" / "session_guard.py",
+        Path.home() / ".codex" / "skills" / "codex-restore-sessions" / "scripts"
+        / "session_guard.py",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def run_migration(spec: Spec, migrator: Path, skip_live: bool) -> dict[str, object]:
+    command = [
+        sys.executable,
+        str(migrator),
+        "--codex-home",
+        str(spec.codex_home),
+        "--compact",
+        "switch",
+        "--provider",
+        spec.shared_provider_id,
+        "--deep",
+    ]
+    if skip_live:
+        command.append("--skip-live")
+    proc = subprocess.run(command, capture_output=True, text=True, timeout=1800)
+    tail = (proc.stdout or proc.stderr or "").strip().splitlines()[-25:]
+    return {
+        "command": " ".join(command),
+        "returncode": proc.returncode,
+        "output": "\n".join(tail),
+    }
+
+
+def apply_plan(
+    spec: Spec, changes: list[Change], migrator: Path | None, skip_live: bool
+) -> dict[str, object]:
+    backups = backup_dir(spec.codex_home)
+    applied: list[dict[str, str]] = []
+
+    for change in changes:
+        if change.unchanged:
+            applied.append({"path": change.path, "action": "already correct"})
+            continue
+
+        if change.kind in {"write", "bashrc"}:
+            path = Path(change.path)
+            if path.exists():
+                saved = backups / f"{path.name}.{abs(hash(str(path))) % 100000}"
+                shutil.copy2(path, saved)
+            else:
+                saved = None
+            assert change.content is not None
+            atomic_write(path, change.content)
+            if path.suffix == ".toml":
+                try:
+                    validate_toml(path)
+                except Exception as exc:  # restore and stop; a broken config breaks codex
+                    if saved is not None:
+                        shutil.copy2(saved, path)
+                    die(f"{path} would be invalid TOML ({exc}); restored original")
+            applied.append(
+                {
+                    "path": change.path,
+                    "action": "written",
+                    "backup": str(saved) if saved else "(new file)",
+                }
+            )
+
+        elif change.kind == "symlink":
+            link = Path(change.path)
+            assert change.target is not None
+            if link.is_symlink():
+                # Never steal a link that points somewhere else — it may be another
+                # host's real Codex home. plan() already reported this as a gap.
+                current = os.readlink(link)
+                if Path(current).resolve() != Path(change.target).resolve():
+                    applied.append(
+                        {
+                            "path": change.path,
+                            "action": f"refused: already links to {current}",
+                        }
+                    )
+                    continue
+                applied.append({"path": change.path, "action": "already correct"})
+                continue
+            if link.exists():
+                applied.append({"path": change.path, "action": "skipped (real path exists)"})
+                continue
+            link.symlink_to(change.target)
+            applied.append(
+                {"path": change.path, "action": f"symlinked -> {change.target}"}
+            )
+
+    result: dict[str, object] = {"backup_dir": str(backups), "applied": applied}
+
+    if migrator is None:
+        result["migration"] = {
+            "skipped": "session_guard.py not found next to this script; pass "
+            "--migrator <path>, or migrate manually with `switch --provider <id> --deep`"
+        }
+    else:
+        result["migration"] = run_migration(spec, migrator, skip_live)
+    return result
+
+
+# --------------------------------------------------------------------------- verify
+
+
+BANNER = re.compile(r"^(model|provider|approval|sandbox):[ \t]*(.+?)[ \t]*$")
+
+
+def probe_channel(
+    spec: Spec, profile: str | None, env_keys: list[str], timeout: int = 90
+) -> dict[str, str]:
+    """Ask the real codex binary what it resolves. Never passes a real key.
+
+    Reads the banner as it streams and kills the process as soon as all four
+    fields are in hand: profiles with a high request_max_retries would otherwise
+    keep retrying a placeholder key long past any deadline, and output captured
+    via communicate() is lost when the deadline hits.
+    """
+    command = ["codex"]
+    if profile:
+        command += ["-p", profile]
+    command += ["exec", "--strict-config", "probe"]
+    env = dict(os.environ)
+    env["CODEX_HOME"] = str(spec.codex_home)
+    env.pop("CODEX_API_KEY", None)
+    for name in env_keys:
+        env.setdefault(name, "placeholder-not-a-real-key")
+
+    wanted = {"model", "provider", "approval", "sandbox"}
+    found: dict[str, str] = {}
+    try:
+        proc = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env=env,
+        )
+    except FileNotFoundError:
+        return {"error": "codex binary not found on PATH"}
+
+    deadline = time.monotonic() + timeout
+    try:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            match = BANNER.match(line.rstrip("\n"))
+            if match:
+                found[match.group(1)] = match.group(2)
+                if wanted <= found.keys():
+                    break
+            if time.monotonic() > deadline:
+                break
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
+
+    if not found:
+        return {"error": f"codex printed no banner within {timeout}s"}
+    missing = sorted(wanted - found.keys())
+    if missing:
+        found["incomplete"] = f"banner lacked {', '.join(missing)}"
+    return found
+
+
+def verify(spec: Spec) -> dict[str, object]:
+    env_keys = [p.env_key for p in spec.providers if p.env_key]
+    report: dict[str, object] = {"codex_home": str(spec.codex_home), "channels": {}}
+    problems: list[str] = []
+    warnings: list[str] = []
+    channels: dict[str, dict[str, str]] = {}
+
+    targets: list[tuple[str, str | None, str, str]] = []
+    if spec.manage_official:
+        targets.append(
+            ("(default)", None, OFFICIAL_BASE_URL, str(spec.official.get("model") or ""))
+        )
+    for provider in spec.providers:
+        targets.append((provider.ident, provider.ident, provider.base_url, provider.model))
+
+    for label, profile, expected_url, expected_model in targets:
+        found = probe_channel(spec, profile, env_keys)
+        if "error" in found:
+            problems.append(f"{label}: {found['error']}")
+            channels[label] = found
+            continue
+        found["expected_base_url"] = expected_url
+        channels[label] = found
+        if found.get("provider") != spec.shared_provider_id:
+            problems.append(
+                f"{label}: provider id is {found.get('provider')!r}, "
+                f"expected {spec.shared_provider_id!r} — resume list will not be shared"
+            )
+        if spec.approval_policy and found.get("approval") != spec.approval_policy:
+            problems.append(
+                f"{label}: approval is {found.get('approval')!r}, expected {spec.approval_policy!r}"
+            )
+        if spec.sandbox_mode and found.get("sandbox") != spec.sandbox_mode:
+            problems.append(
+                f"{label}: sandbox is {found.get('sandbox')!r}, expected {spec.sandbox_mode!r}"
+            )
+        if expected_model and found.get("model") != expected_model:
+            # A trusted-project entry matching the cwd can shadow a profile's
+            # top-level keys; the provider table still applies, so routing is fine.
+            warnings.append(
+                f"{label}: model resolves to {found.get('model')!r}, profile asks for "
+                f"{expected_model!r}. Routing is unaffected (base_url still comes from the "
+                "profile). A [projects.\"<cwd>\"] entry in the base config can shadow a "
+                "profile's root-level keys — pass `-m <model>` or `-c model=...` when the "
+                "exact model matters."
+            )
+
+    report["channels"] = channels
+
+    # base_url is not in the banner; read it back from each config instead.
+    for provider in spec.providers:
+        path = spec.codex_home / f"{provider.ident}.config.toml"
+        if not path.is_file():
+            problems.append(f"{provider.ident}: {path} missing")
+            continue
+        with path.open("rb") as stream:
+            data = tomllib.load(stream)
+        table = (data.get("model_providers") or {}).get(spec.shared_provider_id) or {}
+        if table.get("base_url") != provider.base_url:
+            problems.append(
+                f"{provider.ident}: base_url is {table.get('base_url')!r}, "
+                f"expected {provider.base_url!r}"
+            )
+        if provider.env_key and table.get("env_key") != provider.env_key:
+            problems.append(
+                f"{provider.ident}: env_key is {table.get('env_key')!r}, "
+                f"expected {provider.env_key!r}"
+            )
+
+    db = spec.codex_home / "state_5.sqlite"
+    if db.is_file():
+        import sqlite3
+
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)  # mode=ro so the WAL is honoured
+        try:
+            rows = dict(
+                con.execute("SELECT model_provider, COUNT(*) FROM threads GROUP BY 1").fetchall()
+            )
+        finally:
+            con.close()
+        report["session_providers"] = rows
+        stale = {k: v for k, v in rows.items() if k != spec.shared_provider_id}
+        if stale:
+            problems.append(
+                f"{sum(stale.values())} session(s) still on {sorted(stale)} — invisible in every "
+                "resume picker; re-run the migration with --deep"
+            )
+
+    for provider in spec.providers:
+        gap = check_key_file(provider)
+        if gap is not None:
+            problems.append(f"{gap.what}: {gap.detail}")
+
+    report["problems"] = problems
+    report["warnings"] = warnings
+    report["ok"] = not problems
+    return report
+
+
+# ------------------------------------------------------------------------------- cli
+
+
+def describe_plan(changes: list[Change], gaps: list[Gap]) -> str:
+    lines: list[str] = []
+    todo = [c for c in changes if not c.unchanged]
+    same = [c for c in changes if c.unchanged]
+    lines.append(f"{len(todo)} change(s) to apply, {len(same)} already correct\n")
+    for change in todo:
+        verb = {
+            "write": "write   ",
+            "bashrc": "splice  ",
+            "symlink": "symlink ",
+            "migrate": "migrate ",
+        }[change.kind]
+        suffix = f" -> {change.target}" if change.target else ""
+        lines.append(f"  {verb}{change.path}{suffix}")
+        lines.append(f"            {change.reason}")
+    if same:
+        lines.append("\nalready correct:")
+        for change in same:
+            lines.append(f"  ok      {change.path}")
+    if gaps:
+        lines.append("\ngaps needing a human (everything else still proceeds):")
+        for gap in gaps:
+            lines.append(f"  !  {gap.what}")
+            lines.append(f"     {gap.detail}")
+    return "\n".join(lines)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("mode", choices=["plan", "apply", "verify"])
+    parser.add_argument("--spec", required=True, help="path to the host spec TOML")
+    parser.add_argument("--json", action="store_true", help="machine-readable output")
+    parser.add_argument("--migrator", help="path to session_guard.py if not auto-found")
+    parser.add_argument(
+        "--no-skip-live",
+        action="store_true",
+        help="fail instead of skipping rollout files a live codex is appending to",
+    )
+    args = parser.parse_args()
+
+    spec = load_spec(expand(args.spec))
+
+    if args.mode == "verify":
+        report = verify(spec)
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return 0 if report["ok"] else 1
+
+    changes, gaps = build_plan(spec)
+
+    if args.mode == "plan":
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "changes": [c.__dict__ for c in changes],
+                        "gaps": [g.__dict__ for g in gaps],
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                    default=str,
+                )
+            )
+        else:
+            print(describe_plan(changes, gaps))
+        return 0
+
+    migrator = find_migrator(args.migrator)
+    result = apply_plan(spec, changes, migrator, skip_live=not args.no_skip_live)
+    result["gaps"] = [g.__dict__ for g in gaps]
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    migration = result.get("migration") or {}
+    if isinstance(migration, dict) and migration.get("returncode") not in (0, None):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
