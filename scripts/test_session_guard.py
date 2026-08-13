@@ -15,6 +15,7 @@ except ModuleNotFoundError:  # Python 3.10
     import tomli as tomllib
 
 SCRIPT = Path(__file__).with_name("session_guard.py")
+QUICK = Path(__file__).with_name("quick_restore.py")
 
 
 def run(home: Path, *args: str) -> dict:
@@ -181,6 +182,7 @@ def main() -> None:
     check_deep_switch()
     check_unify()
     check_migration()
+    check_quick_restore()
     print("session_guard self-test passed")
 
 
@@ -648,6 +650,53 @@ def verify_only(bundle: Path) -> dict:
         text=True,
     )
     return json.loads(result.stdout)
+
+
+def run_quick(home: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, str(QUICK), "--codex-home", str(home), *args],
+        capture_output=True,
+        text=True,
+    )
+
+
+def check_quick_restore() -> None:
+    """The short entry point checks and restores without duplicating core logic."""
+    with tempfile.TemporaryDirectory() as raw:
+        home = Path(raw)
+        active = home / "sessions/2026/01/01/rollout-active.jsonl"
+        rollout(active, "active", "old")
+        (home / "config.toml").write_text('model_provider = "new"\n')
+        make_db(
+            home,
+            [("active", str(active), 0, None, "old", "m", "", "t", "u", "p")],
+        )
+
+        checked = run_quick(home, "--check", "--json")
+        assert checked.returncode == 0, checked.stderr
+        diagnosis = json.loads(checked.stdout)
+        assert diagnosis["health"] == "action-recommended", diagnosis
+        human_check = run_quick(home, "--check")
+        assert human_check.returncode == 0, human_check.stderr
+        assert "Session check: ACTION-RECOMMENDED" in human_check.stdout
+        assert "Recommended: restore" in human_check.stdout
+        assert "quick_restore.py" in human_check.stdout
+
+        restored = run_quick(home)
+        assert restored.returncode == 0, restored.stderr
+        assert "Session restore complete" in restored.stdout, restored.stdout
+        assert "provider=new" in restored.stdout, restored.stdout
+        assert "Sessions: 1 (1 active, 0 archived); rollouts=1" in restored.stdout
+        provider = sqlite3.connect(home / "state_5.sqlite").execute(
+            "select model_provider from threads where id='active'"
+        ).fetchone()[0]
+        assert provider == "new"
+
+        unchanged = run_quick(home, "--json")
+        assert unchanged.returncode == 0, unchanged.stderr
+        payload = json.loads(unchanged.stdout)
+        assert payload["backup"] is None, payload
+        assert payload["audit"]["problems"] == {}, payload
 
 
 def make_db(home: Path, rows: list[tuple]) -> None:

@@ -16,15 +16,32 @@ support guarded mutations; run `capabilities` before assuming mutation support o
 
 | User intent | First action | Continue with |
 |---|---|---|
+| Check the usual local home without changing it | `quick_restore.py --check` | Run the recommended action only when requested |
+| Restore after a routine provider or relay switch | `quick_restore.py` | Report the returned summary |
 | Diagnose missing or inconsistent sessions | `capabilities`, then `doctor` | [references/restoration.md](references/restoration.md) |
 | Preview a provider/profile change | `plan` | Apply only when `safe_to_apply` is true |
-| Restore after a routine provider or relay switch | guarded `restore` | Verify the returned audit |
 | Repair names, prune stale rows, unify profiles, or roll back | compact `audit` | [references/restoration.md](references/restoration.md) |
 | Move sessions between homes or machines | audit both ends | [references/migration.md](references/migration.md) |
 | Configure a fresh host or add provider profiles | provision `plan` | [references/provisioning.md](references/provisioning.md) |
 | Codex version/schema behavior is uncertain | `capabilities` and `audit` | [references/compatibility.md](references/compatibility.md) |
 
 Read only the reference required by the selected row.
+
+## Quick Restore
+
+Use the short entry point for the common local case. It resolves `CODEX_HOME`, otherwise
+`~/.codex`, and delegates all validation, backup, locking, deep repair, and live-file handling to
+the guarded engine.
+
+```bash
+python3 scripts/quick_restore.py --check  # read-only
+python3 scripts/quick_restore.py          # guarded restore
+```
+
+Add `--profile <name>` when the user runs `codex -p <name>`. Use `--codex-home <path>` only when
+the user names a different home. The default output is a short human-readable summary; add `--json`
+when structured output is required. If live sessions are deferred, report them and rerun after they
+exit.
 
 ## Discover Capabilities
 
@@ -63,7 +80,7 @@ blockers. Do not mutate when `safe_to_apply` is false.
 
 ## Run A Guarded Restore
 
-For a routine local provider or relay change, run one guarded restore:
+For advanced automation or an explicit target provider, call the guarded engine directly:
 
 ```bash
 python3 scripts/session_guard.py --codex-home <absolute-home> --compact restore

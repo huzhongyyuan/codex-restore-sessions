@@ -2,10 +2,11 @@
 
 > Provision a Codex host, and safely audit, repair, migrate, and roll back local session metadata.
 
-两件事，两个脚本：
+常用恢复只要一个短命令；高级操作仍由原来的守护引擎完成：
 
 | 目标 | 脚本 |
 |---|---|
+| 自动寻找 Codex home，快速检查或恢复已有 session | `scripts/quick_restore.py` |
 | 在新机器上从零搭好：多服务商 profile、`codex-<id>` 包装函数、权限档位、软链接 | `scripts/provision_codex.py` |
 | 修已经存在的 session：provider 漂移、名称丢失、跨机迁移、回滚 | `scripts/session_guard.py` |
 
@@ -37,12 +38,17 @@ python3 -m pip install -r \
   "${CODEX_HOME:-$HOME/.codex}/skills/codex-restore-sessions/requirements.txt"
 ```
 
-重启 Codex 后，普通使用只需要说“检查我的 sessions”或“恢复所有旧 sessions”。命令行对应为：
+重启 Codex 后，普通使用只需要说“检查我的 sessions”或“恢复所有旧 sessions”。命令行只需：
 
 ```bash
-python3 "${CODEX_HOME:-$HOME/.codex}/skills/codex-restore-sessions/scripts/session_guard.py" doctor
-python3 "${CODEX_HOME:-$HOME/.codex}/skills/codex-restore-sessions/scripts/session_guard.py" --compact restore
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/codex-restore-sessions/scripts/quick_restore.py" --check
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/codex-restore-sessions/scripts/quick_restore.py"
 ```
+
+不需要填写 home 或 provider：脚本优先使用 `CODEX_HOME`，否则自动使用 `~/.codex`，provider
+从当前配置识别。它不是简化版修复器，而是调用完整守护引擎，仍然会检查一致性、增量备份、
+深度修复 provider，并跳过仍在写入的 live session。需要指定 profile 时加 `--profile <name>`；
+需要给程序读取结果时加 `--json`。
 
 > 关于 Codex 内部行为的结论（resume 的过滤字段、rollout 文件里 provider 的记录位置、
 > `[projects]` 遮蔽 profile 顶层键）来自对 **codex-cli 0.144.3** 的黑盒实验和 `strings`
@@ -204,6 +210,13 @@ python3 "$SKILL_DIR/scripts/session_guard.py" \
 ```bash
 python3 "$SKILL_DIR/scripts/session_guard.py" \
   --codex-home "$CODEX_DIR" doctor
+```
+
+日常使用可省略这些参数：
+
+```bash
+python3 "$SKILL_DIR/scripts/quick_restore.py" --check
+python3 "$SKILL_DIR/scripts/quick_restore.py"
 ```
 
 ### 新服务器上让多服务商共享 session

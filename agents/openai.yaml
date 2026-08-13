@@ -1,4 +1,4 @@
 interface:
   display_name: "Restore Codex Sessions"
   short_description: "Diagnose and safely restore Codex sessions in one command"
-  default_prompt: "Use $codex-restore-sessions to run a read-only session health check and recommend or perform a guarded restore."
+  default_prompt: "Use $codex-restore-sessions to quickly check or restore my local Codex sessions with the guarded zero-configuration workflow."
