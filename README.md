@@ -1,4 +1,4 @@
-# Codex Session Guard
+# Codex Restore Sessions
 
 > Provision a Codex host, and safely audit, repair, migrate, and roll back local session metadata.
 
@@ -18,36 +18,48 @@
 
 ## 30 秒安装与更新
 
-首次安装：
+最省事的方式是在 Codex 里说：
+
+```text
+使用 $skill-installer 安装 https://github.com/huzhongyyuan/codex-restore-sessions
+```
+
+手动安装到 Codex 当前推荐的个人 skill 目录：
 
 ```bash
+mkdir -p "$HOME/.agents/skills"
 git clone --depth 1 https://github.com/huzhongyyuan/codex-restore-sessions.git \
-  "${CODEX_HOME:-$HOME/.codex}/skills/codex-restore-sessions"
+  "$HOME/.agents/skills/codex-restore-sessions"
 ```
 
 以后更新：
 
 ```bash
-git -C "${CODEX_HOME:-$HOME/.codex}/skills/codex-restore-sessions" pull --ff-only
+git -C "$HOME/.agents/skills/codex-restore-sessions" pull --ff-only
 ```
+
+若旧版已安装在 `~/.codex/skills/codex-restore-sessions`，可以先在那个实际目录执行同样的
+`git pull --ff-only`；迁移到 `.agents/skills` 时不要同时保留两个同名副本。
 
 使用 Python 3.9/3.10 时，再安装一次兼容依赖：
 
 ```bash
 python3 -m pip install -r \
-  "${CODEX_HOME:-$HOME/.codex}/skills/codex-restore-sessions/requirements.txt"
+  "$HOME/.agents/skills/codex-restore-sessions/requirements.txt"
 ```
 
-重启 Codex 后，普通使用只需要说“检查我的 sessions”或“恢复所有旧 sessions”。命令行只需：
+安装后用 `/skills` 确认它已出现；若没出现，重启 Codex。普通使用只需要说“检查我的 sessions”
+或“恢复所有旧 sessions”。命令行只需：
 
 ```bash
-python3 "${CODEX_HOME:-$HOME/.codex}/skills/codex-restore-sessions/scripts/quick_restore.py" --check
-python3 "${CODEX_HOME:-$HOME/.codex}/skills/codex-restore-sessions/scripts/quick_restore.py"
+SKILL_DIR="$HOME/.agents/skills/codex-restore-sessions"
+python3 "$SKILL_DIR/scripts/quick_restore.py" --check
+python3 "$SKILL_DIR/scripts/quick_restore.py"
 ```
 
 不需要填写 home 或 provider：脚本优先使用 `CODEX_HOME`，否则自动使用 `~/.codex`，provider
 从当前配置识别。它不是简化版修复器，而是调用完整守护引擎，仍然会检查一致性、增量备份、
-深度修复 provider，并跳过仍在写入的 live session。需要指定 profile 时加 `--profile <name>`；
+深度修复 provider，并跳过仍被打开、仍在增长或无法安全判断的 live session。需要指定 profile 时加 `--profile <name>`；
 需要给程序读取结果时加 `--json`。
 
 > 关于 Codex 内部行为的结论（resume 的过滤字段、rollout 文件里 provider 的记录位置、
@@ -72,17 +84,24 @@ python3 "${CODEX_HOME:-$HOME/.codex}/skills/codex-restore-sessions/scripts/quick
 ## 在新机器上搭一套
 
 ```bash
-cp assets/spec.example.toml my-host.toml   # 改 base_url / key 路径
-python3 scripts/provision_codex.py plan   --spec my-host.toml   # 只看，不改
-python3 scripts/provision_codex.py apply  --spec my-host.toml
-python3 scripts/provision_codex.py verify --spec my-host.toml
+SKILL_DIR="$HOME/.agents/skills/codex-restore-sessions"
+cp "$SKILL_DIR/assets/spec.example.toml" my-host.toml   # 改 base_url / key 路径
+python3 "$SKILL_DIR/scripts/provision_codex.py" plan   --spec my-host.toml   # 只看，不改
+python3 "$SKILL_DIR/scripts/provision_codex.py" apply  --spec my-host.toml
+python3 "$SKILL_DIR/scripts/provision_codex.py" verify --spec my-host.toml
 ```
 
 `plan` 什么都不写。`apply` 只做 `plan` 列出的事，每个被改的文件都有备份路径。
-`verify` 用真实 `codex` 二进制回读，有偏差就非零退出。重复跑是幂等的。
+`verify` 用真实 `codex` 二进制回读，有偏差就非零退出。若 spec 指定的 `codex_home` 尚不存在，
+`plan` 会明确列出创建动作，`apply` 以 `0700` 创建它；重复跑是幂等的。
 
 spec 文件只含路径不含密钥，但会含你的内网域名和绝对路径，**建议放在仓库外**
 （`.gitignore` 已排除 `spec.*.toml`）。
+
+不要把 `Authorization`、`X-API-Key`、token、cookie 等敏感值直接写进 provider 的
+`http_headers` 或 URL 查询参数；脚本会在规划前拒绝。需要认证 header 时使用
+`env_http_headers`，只在 spec 中填写环境变量名。JSON 计划只返回内容长度与 SHA-256，
+不回显待写配置全文。
 
 key 文件自己建，工具不碰值：
 
@@ -144,11 +163,14 @@ Codex 启动横幅里的 `provider: <id>` 是 provider **id**，不是服务商�
 - 修改前审计，发现路径、ID、归档位置、重复项或 journal 异常时拒绝写入
 - 使用 SQLite backup API 创建一致的数据库备份并校验完整性与 SHA-256
 - 原子改写明确识别出的 provider 元数据，保留其余 conversation events
-- 修改期间加本地文件锁，并检测并发数据库或文件变化
+- 修改期间加本地文件锁，并检测仍被进程打开、正在增长、并发变化或状态无法确认的 rollout
+- 写入后深度验证数据库与每一个已识别的 JSONL provider 位置；失败时非零退出并保留备份
+- 文件与备份在 rename 后同步目录元数据，降低掉电后“成功但未持久化”的风险
 - provider 同步默认不改写历史 model、时间戳和归档状态；只修复无歧义的空名称
 - `prune` 只删除 rollout 文件确实不存在的行；文件仍在的行一律拒绝删除
 - 迁移 bundle 逐文件校验 SHA-256，目标 home 已有 session 时拒绝导入
 - 不读取、输出、散列、复制或备份 `auth.json`、API key、token 与凭据环境变量
+- provisioning 拒绝 URL 凭据、敏感 literal header/查询参数，JSON plan 不回显完整配置
 - 不提高 Codex 的 approval policy 或 sandbox mode
 
 ## 安装
@@ -162,7 +184,7 @@ Codex 启动横幅里的 `provider: <id>` 是 provider **id**，不是服务商�
 
 ```bash
 python3 -m pip install -r \
-  "${CODEX_HOME:-$HOME/.codex}/skills/codex-restore-sessions/requirements.txt"
+  "$HOME/.agents/skills/codex-restore-sessions/requirements.txt"
 ```
 
 重启 Codex 后，可直接说：
@@ -175,11 +197,11 @@ Codex 会读取 `SKILL.md` 并使用受保护的默认流程。
 
 ## 命令行使用
 
-以下示例假设仓库位于 `$CODEX_HOME/skills/codex-restore-sessions`；未设置 `CODEX_HOME` 时使用
-`$HOME/.codex`。
+以下示例把 skill 安装在 `$HOME/.agents/skills/codex-restore-sessions`。skill 的安装目录与
+Codex 数据 home 是两件事：`CODEX_HOME` 只控制 session/config 存放位置。
 
 ```bash
-SKILL_DIR="${CODEX_HOME:-$HOME/.codex}/skills/codex-restore-sessions"
+SKILL_DIR="$HOME/.agents/skills/codex-restore-sessions"
 CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
 ```
 
@@ -256,18 +278,19 @@ python3 "$SKILL_DIR/scripts/session_guard.py" \
 ```
 
 目标 provider 来自当前 `config.toml`。`restore` 默认深度修复所有已识别的 provider 元数据位置，
-并把仍在增长的 rollout 文件列入延期清单。一次 `restore` 已包含：
+并把仍被打开、仍在增长或无法可靠判断状态的 rollout 文件列入延期清单。一次 `restore` 已包含：
 
 1. 写入前完整审计
 2. 数据库一致性备份与 manifest
 3. SQLite 和 rollout JSONL 的受保护修改
-4. 写入后完整审计
+4. 写入后完整审计与独立后置条件验证
 
 成功输出中应满足：
 
 - `problems` 为空
 - `threads == rollout_files`
 - SQLite 与 JSONL provider 均等于目标 provider
+- `postconditions.verified` 为 `true`，且所有非延期 JSONL provider 记录都经过深度验证
 - 有实际修改时返回 `backup` 路径；已经一致时 `backup: null` 是正常 no-op
 
 如需明确指定 provider：
@@ -364,19 +387,22 @@ before/after 都进 manifest，
 `rollback` 能逐字节还原。已在 3 MB 的真实会话文件上验证过：改动仅限 provider 字段，
 回滚后与原文件 sha256 完全一致。
 
-#### 跳过正在写入的会话
+#### 跳过仍被使用或无法安全确认的会话
 
-正在运行的 Codex 会话会持续往自己的 rollout 文件追加内容。改写走的是临时文件加 rename，
-审计与 rename 之间落下的追加会丢失。`restore` 默认检测并跳过仍在增长的文件：
+正在运行的 Codex 会话可能持续追加 rollout，也可能暂时空闲但仍保持文件句柄。改写走的是临时文件
+加 rename，审计与 rename 之间落下的追加会丢失。`restore` 默认检测并跳过被进程打开、仍在增长、
+审计后变化或检测器无法确认的文件：
 
 ```bash
 python3 "$SKILL_DIR/scripts/session_guard.py" \
   --codex-home "$CODEX_DIR" --compact restore --provider shared
 ```
 
-活跃文件会被原样跳过（保留旧 provider），其余全部照常迁移，跳过的路径列在返回的
-`deferred_live_sessions` 里，同时在 `session_guard_state.json` 记下条数，避免下一次运行被误判成
-no-op。那些会话退出后再跑一次即可收尾。
+这些文件会被原样跳过（数据库受控字段也保持原值），其余全部照常迁移。返回的
+`deferred_live_sessions` 列出路径，`deferred_live_reasons` 给出 `open-file:*`、`growing`、
+`changed-since-audit` 或 `open-state-unknown` 等原因；同时在 `session_guard_state.json` 记下条数，
+避免下一次运行被误判成 no-op。会话退出后再跑一次即可收尾。使用 `--fail-live` 可要求发现任一
+延期对象时整次恢复在写入前失败。
 
 ### 清理孤儿行
 
@@ -494,22 +520,24 @@ $CODEX_HOME/backups/session-guard-<UTC timestamp>/
 ## 自检
 
 ```bash
-python3 scripts/test_session_guard.py     # session 修复
-python3 scripts/test_provision_codex.py   # 新机器搭建
+python3 "$SKILL_DIR/scripts/test_session_guard.py"     # session 修复
+python3 "$SKILL_DIR/scripts/test_provision_codex.py"   # 新机器搭建
 ```
 
 `test_session_guard.py` 完全在临时目录中运行，覆盖 doctor、plan、restore、audit、switch、rename、relay fingerprint、
 rollback、恶意 manifest 越界路径拒绝，以及 profile 叠加与继承、per-profile fingerprint、prune
 与其回滚、事务式 bundle 导出/校验/导入、符号链接与凭据排除、非空目标拒绝和 bundle 篡改检测。
 
-新增覆盖：`--skip-live`（真起一个持续追加的写入进程，断言活跃文件保留旧 provider、其余照常迁移、
-写入方退出后重跑收尾）、`--deep`（重复 `session_meta` 加多条 `thread_settings` 的 fixture，断言
+新增覆盖：live deferral（分别真起一个持续追加进程和一个只打开不写的进程，断言活跃文件保留旧
+provider、报告具体原因、其余照常迁移、进程退出后重跑收尾）、恢复后置条件（刻意留下深层旧
+provider 时必须拒绝成功）、`--deep`（重复 `session_meta` 加多条 `thread_settings` 的 fixture，断言
 provider 全部清干净、非 provider 字段与非 ASCII 内容逐字节不变、回滚逐行还原）、`unify`
 （带注释 / 无 provider 表 / 顶层键插入位置三种 config，断言 `base_url` 与 `env_key` 未被改动、
 注释保留、`[projects]` 没有吞掉新键、重跑是 no-op、保留 id `openai` 被拒绝）。
 
 `test_provision_codex.py` 同样只在临时目录里跑，断言 `plan` 不写文件、生成的 config 与
-shell rc 里不含密钥值、规划时不打开凭据内容、无操作运行不创建空备份、模板不固定模型版本、
+shell rc 里不含密钥值、规划时不打开凭据内容、JSON plan 不回显待写配置、敏感 literal header 与
+URL 凭据会被拒绝、`env_http_headers` 可安全通过、无操作运行不创建空备份、模板不固定模型版本、
 重跑幂等且包装函数不重复、保留 id 与
 `CODEX_API_KEY` 被拒绝、缺 key 文件只报 gap、异常权限被标记。其中两条是回归测试：
 `$HOME/.codex` 已指向别处时必须

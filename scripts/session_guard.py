@@ -14,6 +14,7 @@ import platform
 import re
 import shutil
 import sqlite3
+import subprocess
 import tempfile
 import time
 import urllib.parse
@@ -58,6 +59,14 @@ CREDENTIAL_NAMES = {
 CREDENTIAL_SUFFIXES = (".key", ".p12", ".pfx", ".pem")
 
 
+def open_file_detection_backend() -> str | None:
+    if (Path("/proc") / str(os.getpid()) / "fd").is_dir():
+        return "procfs"
+    if shutil.which("lsof"):
+        return "lsof"
+    return None
+
+
 def environment_capabilities(raw_home: str | None) -> dict[str, object]:
     """Report portable prerequisites without opening a database or mutating state.
 
@@ -76,6 +85,7 @@ def environment_capabilities(raw_home: str | None) -> dict[str, object]:
         "toml_backend": TOML_BACKEND,
         "sqlite": sqlite3.sqlite_version,
         "lock_backend": lock_backend,
+        "open_file_detection": open_file_detection_backend(),
         "mutation_supported": lock_backend is not None,
         "codex_home": str(home),
         "codex_home_exists": home.is_dir(),
@@ -121,6 +131,19 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def fsync_directory(path: Path) -> None:
+    directory_fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def fsync_file(path: Path) -> None:
+    with path.open("rb") as stream:
+        os.fsync(stream.fileno())
+
+
 def atomic_write(
     path: Path,
     data: bytes,
@@ -136,20 +159,18 @@ def atomic_write(
             os.fsync(stream.fileno())
         if mode is not None:
             os.chmod(temp, mode)
+            fsync_file(temp)
         os.replace(temp, path)
         if times_ns is not None:
             os.utime(path, ns=times_ns)
+            fsync_file(path)
+        fsync_directory(path.parent)
     finally:
         temp.unlink(missing_ok=True)
 
 
 def write_json(path: Path, value: object) -> None:
     atomic_write(path, (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode())
-    directory_fd = os.open(path.parent, os.O_RDONLY)
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
 
 
 def resolve_home(raw: str | None) -> Path:
@@ -802,8 +823,12 @@ def require_mutation_schema(context: dict[str, object]) -> None:
 def mutation_lock(home: Path):
     if fcntl is None:
         die("Mutating modes are not supported on this platform because advisory locking is unavailable")
-    lock_path = home / "backups" / "session-guard.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    backup_root = home / "backups"
+    backup_root_existed = backup_root.exists()
+    backup_root.mkdir(parents=True, exist_ok=True)
+    if not backup_root_existed:
+        fsync_directory(home)
+    lock_path = backup_root / "session-guard.lock"
     with lock_path.open("a+") as stream:
         os.chmod(lock_path, 0o600)
         try:
@@ -957,7 +982,9 @@ def rewrite_lines(change: dict[str, object], use_after: bool) -> None:
         if missing:
             die(f"Recorded lines are missing from {path}: {missing}")
         shutil.copystat(path, temp)
+        fsync_file(temp)
         os.replace(temp, path)
+        fsync_directory(path.parent)
     except BaseException:
         temp.unlink(missing_ok=True)
         raise
@@ -975,12 +1002,15 @@ def create_backup(
     backup = home / "backups" / f"session-guard-{stamp}"
     backup.mkdir(parents=True, mode=0o700, exist_ok=False)
     os.chmod(backup, 0o700)
+    fsync_directory(backup.parent)
     source = sqlite3.connect(context["db"])
     copied = sqlite3.connect(backup / "state.sqlite")
     source.backup(copied)
     copied.close()
     source.close()
     os.chmod(backup / "state.sqlite", 0o600)
+    fsync_file(backup / "state.sqlite")
+    fsync_directory(backup)
     check_con = sqlite3.connect(backup / "state.sqlite")
     check = check_con.execute("pragma integrity_check").fetchone()[0]
     check_con.close()
@@ -1039,50 +1069,282 @@ def replace_first_line(change: dict[str, object], use_after: bool) -> None:
             output.flush()
             os.fsync(output.fileno())
         os.chmod(temp, stat.st_mode)
+        fsync_file(temp)
         if path.stat().st_mtime_ns != stat.st_mtime_ns or path.stat().st_size != stat.st_size:
             die(f"Concurrent write detected in {path}")
         os.replace(temp, path)
         os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
-        directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        fsync_file(path)
+        fsync_directory(path.parent)
     finally:
         temp.unlink(missing_ok=True)
 
 
-def live_rollouts(context: dict[str, object], settle_seconds: float = 2.0) -> set[str]:
-    """Rollout files still being appended to by a running Codex session.
+def procfs_open_paths(targets: set[str]) -> set[str]:
+    """Find target paths opened by same-user processes through Linux procfs."""
+    found: set[str] = set()
+    proc = Path("/proc")
+    own_uid = os.getuid() if hasattr(os, "getuid") else None
+    for process in proc.iterdir():
+        if not process.name.isdigit():
+            continue
+        try:
+            if own_uid is not None and process.stat().st_uid != own_uid:
+                continue
+            descriptors = list((process / "fd").iterdir())
+        except PermissionError as error:
+            raise OSError(f"cannot inspect open files for process {process.name}") from error
+        except OSError:
+            continue
+        for descriptor in descriptors:
+            try:
+                raw = os.readlink(descriptor)
+            except OSError:
+                continue
+            if raw.endswith(" (deleted)"):
+                raw = raw[: -len(" (deleted)")]
+            if raw in targets:
+                found.add(raw)
+                continue
+            if raw.startswith("/"):
+                resolved = str(Path(raw).resolve())
+                if resolved in targets:
+                    found.add(resolved)
+        if found == targets:
+            break
+    return found
 
-    A live session holds an open fd and appends as the turn progresses. Rewriting
-    the first line goes through a temp file plus rename, so any append that lands
-    between the audit stat and the rename is lost. Sample twice and treat anything
-    that moves -- or that already drifted from the audit stat -- as live.
+
+def lsof_open_paths(targets: set[str]) -> set[str]:
+    """Find open target paths with lsof, batching to avoid argument-size limits."""
+    executable = shutil.which("lsof")
+    if not executable:
+        return set()
+    found: set[str] = set()
+    ordered = sorted(targets)
+    for start in range(0, len(ordered), 100):
+        batch = ordered[start : start + 100]
+        result = subprocess.run(
+            [executable, "-Fn", "--", *batch],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode not in (0, 1):
+            raise OSError(f"lsof failed with exit code {result.returncode}")
+        for line in result.stdout.splitlines():
+            if not line.startswith("n"):
+                continue
+            raw = line[1:]
+            if raw in targets:
+                found.add(raw)
+                continue
+            if raw.startswith("/"):
+                resolved = str(Path(raw).resolve())
+                if resolved in targets:
+                    found.add(resolved)
+    return found
+
+
+def open_rollout_paths(targets: set[str]) -> tuple[set[str], str | None]:
+    backend = open_file_detection_backend()
+    if not targets or backend is None:
+        return set(), backend
+    try:
+        if backend == "procfs":
+            return procfs_open_paths(targets), backend
+        return lsof_open_paths(targets), backend
+    except (OSError, subprocess.SubprocessError):
+        # A failed detector is not evidence that files are closed. The caller
+        # treats the entire set as uncertain and defers it.
+        return set(), None
+
+
+def live_rollout_reasons(
+    context: dict[str, object], settle_seconds: float = 2.0
+) -> dict[str, str]:
+    """Classify live or uncertain rollouts conservatively.
+
+    A rollout held open between turns can remain unchanged for minutes. Sampling
+    size/mtime alone would call it idle, rename it, and let a later append land on
+    the old inode. Use open-file detection where available and treat detector
+    failure as uncertainty rather than proof that every file is closed.
     """
+    targets = set(context["metadata"])
+    open_first, backend_first = open_rollout_paths(targets)
     first: dict[str, tuple[int, int]] = {}
     for path_string, (_, _, audit_stat) in context["metadata"].items():
         try:
             stat = Path(path_string).stat()
         except OSError:
+            first[path_string] = (-2, -2)
             continue
         if (stat.st_size, stat.st_mtime_ns) != (audit_stat[2], audit_stat[3]):
             first[path_string] = (-1, -1)
         else:
             first[path_string] = (stat.st_size, stat.st_mtime_ns)
     time.sleep(settle_seconds)
-    live = set()
+    open_second, backend_second = open_rollout_paths(targets)
+    backend = backend_first if backend_first == backend_second else None
+    reasons: dict[str, str] = {}
     for path_string, sample in first.items():
+        if path_string in open_first or path_string in open_second:
+            reasons[path_string] = f"open-file:{backend or 'detector'}"
+            continue
         if sample == (-1, -1):
-            live.add(path_string)
+            reasons[path_string] = "changed-since-audit"
+            continue
+        if sample == (-2, -2):
+            reasons[path_string] = "missing-during-live-check"
             continue
         try:
             stat = Path(path_string).stat()
         except OSError:
+            reasons[path_string] = "missing-during-live-check"
             continue
         if (stat.st_size, stat.st_mtime_ns) != sample:
-            live.add(path_string)
-    return live
+            reasons[path_string] = "growing"
+        elif backend is None:
+            reasons[path_string] = "open-state-unknown"
+    return reasons
+
+
+def live_rollouts(context: dict[str, object], settle_seconds: float = 2.0) -> set[str]:
+    return set(live_rollout_reasons(context, settle_seconds))
+
+
+def provider_line_digests(path: Path) -> dict[int, str]:
+    """Hash only records whose provider metadata this tool recognizes."""
+    found: dict[int, str] = {}
+    with path.open("rb") as stream:
+        for index, line in enumerate(stream):
+            if b"model_provider" not in line:
+                continue
+            try:
+                record = json.loads(line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if not isinstance(record, dict):
+                continue
+            payload = record.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            session_provider = (
+                record.get("type") == "session_meta" and "model_provider" in payload
+            )
+            settings = payload.get("thread_settings")
+            settings_provider = isinstance(settings, dict) and "model_provider_id" in settings
+            if session_provider or settings_provider:
+                found[index] = sha256(line)
+    return found
+
+
+def snapshot_deferred_restore(
+    home: Path, context: dict[str, object], deferred: set[str]
+) -> dict[str, object]:
+    rows = {}
+    for row in context["rows"]:
+        path = str(resolve_rollout(home, str(row["rollout_path"])))
+        if path in deferred:
+            rows[str(row["id"])] = {
+                "model_provider": row.get("model_provider"),
+                "model": row.get("model"),
+                "name": row.get("name"),
+            }
+    provider_lines = {}
+    for path in sorted(deferred):
+        try:
+            provider_lines[path] = provider_line_digests(Path(path))
+        except OSError:
+            die(f"Cannot snapshot deferred rollout before restore: {path}")
+    return {"rows": rows, "provider_lines": provider_lines}
+
+
+def verify_restore_postconditions(
+    home: Path,
+    report: dict[str, object],
+    context: dict[str, object],
+    target_provider: str,
+    deferred: set[str],
+    deferred_before: dict[str, object],
+    backup: Path | None,
+) -> dict[str, object]:
+    """Prove the guarded restore contract before reporting success."""
+    failures: list[str] = []
+    if report["threads"] != report["rollout_files"]:
+        failures.append(
+            f"thread/rollout mismatch ({report['threads']} != {report['rollout_files']})"
+        )
+
+    before_rows = deferred_before.get("rows") or {}
+    non_deferred_rows = 0
+    for row in context["rows"]:
+        identifier = str(row["id"])
+        path = str(resolve_rollout(home, str(row["rollout_path"])))
+        if path in deferred:
+            expected = before_rows.get(identifier)
+            current = {
+                "model_provider": row.get("model_provider"),
+                "model": row.get("model"),
+                "name": row.get("name"),
+            }
+            if expected != current:
+                failures.append(f"deferred database row changed: {identifier}")
+        else:
+            non_deferred_rows += 1
+            if row.get("model_provider") != target_provider:
+                failures.append(f"database provider mismatch: {identifier}")
+
+    non_deferred_rollouts = 0
+    for path_string in context["metadata"]:
+        if path_string in deferred:
+            continue
+        non_deferred_rollouts += 1
+        try:
+            if deep_line_changes(Path(path_string), target_provider):
+                failures.append(f"rollout provider mismatch: {path_string}")
+        except OSError:
+            failures.append(f"rollout could not be read during verification: {path_string}")
+
+    before_lines = deferred_before.get("provider_lines") or {}
+    for path_string in sorted(deferred):
+        try:
+            current = provider_line_digests(Path(path_string))
+        except OSError:
+            failures.append(f"deferred rollout could not be read: {path_string}")
+            continue
+        for index, expected_digest in before_lines.get(path_string, {}).items():
+            if current.get(int(index)) != expected_digest:
+                failures.append(f"deferred rollout changed at line {index}: {path_string}")
+
+    backup_verified = backup is None
+    if backup is not None:
+        manifest_path = backup / "manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text())
+            database_backup = backup / str(manifest.get("database_backup") or "")
+            backup_verified = (
+                manifest.get("status") == "applied"
+                and database_backup.is_file()
+                and sha256_file(database_backup) == manifest.get("database_backup_sha256")
+            )
+        except (OSError, ValueError, TypeError):
+            backup_verified = False
+        if not backup_verified:
+            failures.append("backup manifest or database snapshot could not be verified")
+
+    if failures:
+        retained = f" Backup retained at {backup}." if backup else ""
+        die("Restore postcondition failed: " + "; ".join(failures[:8]) + retained)
+    return {
+        "verified": True,
+        "structural_problems": 0,
+        "thread_rollout_parity": True,
+        "database_rows_verified": non_deferred_rows,
+        "rollout_files_deep_verified": non_deferred_rollouts,
+        "deferred_sessions_preserved": len(deferred),
+        "backup_verified": backup_verified,
+    }
 
 
 def apply_changes(
@@ -1529,7 +1791,8 @@ def unify(home: Path, target: str, skip_live: bool) -> dict[str, object]:
 
     report, context = audit(home)
     require_clean(report)
-    skip = live_rollouts(context) if skip_live else set()
+    skip_reasons = live_rollout_reasons(context) if skip_live else {}
+    skip = set(skip_reasons)
     session_backup = apply_changes(home, context, target, None, True, "switch", skip, True)
     after, _ = audit(home)
     require_clean(after)
@@ -1539,6 +1802,7 @@ def unify(home: Path, target: str, skip_live: bool) -> dict[str, object]:
         "configs": rewrites,
         "session_backup": str(session_backup) if session_backup else None,
         "deferred_live_sessions": sorted(skip),
+        "deferred_live_reasons": skip_reasons,
         "audit": after,
     }
 
@@ -1712,7 +1976,7 @@ def export_bundle(home: Path, destination: Path, profile: str | None) -> dict[st
     live = live_rollouts(context)
     if live:
         die(
-            "Refusing export while rollout files are actively growing: "
+            "Refusing export while rollout files are open, growing, or uncertain: "
             + ", ".join(sorted(live))
         )
 
@@ -2013,7 +2277,7 @@ def parse_args() -> argparse.Namespace:
     switch.add_argument(
         "--skip-live",
         action="store_true",
-        help="Leave rollout files that a running Codex session is still appending to "
+        help="Leave open, growing, or uncertain rollout files "
         "untouched instead of refusing the whole migration; rerun after they exit",
     )
     switch.add_argument(
@@ -2032,7 +2296,7 @@ def parse_args() -> argparse.Namespace:
     restore.add_argument(
         "--fail-live",
         action="store_true",
-        help="Fail on concurrent rollout writes instead of deferring actively growing sessions",
+        help="Fail instead of deferring open, growing, or uncertain rollout files",
     )
     unify_parser = sub.add_parser(
         "unify",
@@ -2123,39 +2387,60 @@ def main() -> None:
 
     if args.command in {"switch", "restore"} and args.provider:
         validate_provider_id(args.provider)
+    postconditions = None
+    skip_reasons: dict[str, str] = {}
     with mutation_lock(home):
         report, context = audit(home, args.verbose, profile)
         skip: set[str] = set()
+        deferred_before: dict[str, object] = {"rows": {}, "provider_lines": {}}
         if args.command == "prune":
             backup = prune(home, context, report)
         else:
             require_clean(report)
             if args.command in {"switch", "restore"}:
                 provider = args.provider or str(context["target"]["provider"])
-                if args.command == "restore" and not args.fail_live:
-                    skip = live_rollouts(context)
+                if args.command == "restore":
+                    skip_reasons = live_rollout_reasons(context)
+                    if args.fail_live and skip_reasons:
+                        preview = ", ".join(
+                            f"{path} ({reason})"
+                            for path, reason in list(sorted(skip_reasons.items()))[:5]
+                        )
+                        die(f"Refusing restore because rollout files are live or uncertain: {preview}")
+                    skip = set(skip_reasons)
                 elif getattr(args, "skip_live", False):
-                    skip = live_rollouts(context)
+                    skip_reasons = live_rollout_reasons(context)
+                    skip = set(skip_reasons)
+                if args.command == "restore" and skip:
+                    deferred_before = snapshot_deferred_restore(home, context, skip)
                 deep = True if args.command == "restore" else args.deep
                 backup = apply_changes(
                     home, context, provider, args.model, True, "switch", skip, deep
                 )
             else:
                 backup = apply_changes(home, context, None, None, True, "repair")
-    after, _ = audit(home, args.verbose, profile)
-    require_clean(after)
+        after, after_context = audit(home, args.verbose, profile)
+        require_clean(after)
+        if args.command == "restore":
+            postconditions = verify_restore_postconditions(
+                home,
+                after,
+                after_context,
+                provider,
+                skip,
+                deferred_before,
+                backup,
+            )
     output = compact_report(after) if args.compact else after
-    print(
-        json.dumps(
-            {
-                "backup": str(backup) if backup else None,
-                "deferred_live_sessions": sorted(skip),
-                "audit": output,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-    )
+    result = {
+        "backup": str(backup) if backup else None,
+        "deferred_live_sessions": sorted(skip),
+        "deferred_live_reasons": skip_reasons,
+        "audit": output,
+    }
+    if postconditions is not None:
+        result["postconditions"] = postconditions
+    print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

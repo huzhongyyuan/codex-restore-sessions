@@ -6,7 +6,7 @@ partial session tree.
 ## Export
 
 ```bash
-python3 scripts/session_guard.py --codex-home <source-home> export <new-bundle-path>
+python3 "$SKILL_DIR/scripts/session_guard.py" --codex-home <source-home> export <new-bundle-path>
 ```
 
 Export refuses audit problems and an existing destination path. The bundle contains session trees,
@@ -23,7 +23,7 @@ failures remove the staging directory.
 Transfer the entire bundle as sensitive conversation data. Verify it without writing:
 
 ```bash
-python3 scripts/session_guard.py verify <bundle>
+python3 "$SKILL_DIR/scripts/session_guard.py" verify <bundle>
 ```
 
 Verification rejects missing, unexpected, symlinked, out-of-bundle, credential-named, or digest-
@@ -35,7 +35,7 @@ Prepare the destination's own `config.toml` and authentication first. The destin
 no session database or rollout files:
 
 ```bash
-python3 scripts/session_guard.py --codex-home <empty-destination-home> --compact import <bundle>
+python3 "$SKILL_DIR/scripts/session_guard.py" --codex-home <empty-destination-home> --compact import <bundle>
 ```
 
 Import rebases absolute rollout paths into the destination home and preserves names, models,
@@ -45,8 +45,8 @@ and JSONL merging is not implemented.
 After import, preview and apply the destination provider mapping:
 
 ```bash
-python3 scripts/session_guard.py --codex-home <destination-home> --compact plan --deep
-python3 scripts/session_guard.py --codex-home <destination-home> --compact restore
+python3 "$SKILL_DIR/scripts/session_guard.py" --codex-home <destination-home> --compact plan --deep
+python3 "$SKILL_DIR/scripts/session_guard.py" --codex-home <destination-home> --compact restore
 ```
 
 Before migrating across large Codex version gaps, compare `schema_columns` from verbose audits on

@@ -92,6 +92,39 @@ def check_plan_is_readonly(root: Path) -> None:
     print("  plan is read-only and complete")
 
 
+def check_fresh_home_created(root: Path) -> None:
+    """A reviewed apply can provision a configured Codex home from zero."""
+    home = root / "fresh-codex-home"
+    spec = write_spec(root, home, link_home=False)
+    planned = run(["plan", "--spec", str(spec)])
+    assert "mkdir" in planned and str(home) in planned, planned
+    assert not home.exists(), "plan must not create the configured home"
+
+    result = json.loads(
+        run(["apply", "--spec", str(spec), "--migrator", "/nonexistent/x.py"])
+    )
+    assert home.is_dir() and (home.stat().st_mode & 0o777) == 0o700
+    assert (home / "config.toml").is_file()
+    assert (home / "relay.config.toml").is_file()
+    assert any(item["action"] == "created directory (0700)" for item in result["applied"])
+    print("  a missing configured Codex home is planned, created as 0700, and provisioned")
+
+
+def check_non_directory_home_rejected(root: Path) -> None:
+    home = root / "not-a-directory"
+    home.write_text("leave me alone")
+    spec = write_spec(root, home, link_home=False)
+    planned = run(["plan", "--spec", str(spec)])
+    assert "is not a directory" in planned, planned
+    failed = run(
+        ["apply", "--spec", str(spec), "--migrator", "/nonexistent/x.py"],
+        expect_ok=False,
+    )
+    assert "configured Codex home is not a directory" in failed, failed
+    assert home.read_text() == "leave me alone"
+    print("  a non-directory Codex home is refused without touching it")
+
+
 def check_apply(root: Path) -> None:
     home = fake_home(root)
     spec = write_spec(root, home)
@@ -329,9 +362,79 @@ def check_passthrough_table(root: Path) -> None:
     print("  passthrough scalars and sub-tables render as valid TOML")
 
 
+def check_sensitive_provider_values_rejected(root: Path) -> None:
+    """Literal credentials never enter plans, configs, output, or backups."""
+    home = fake_home(root)
+    spec = root / "literal-secret.toml"
+    secret = "Bearer must-not-appear"
+    spec.write_text(
+        f'codex_home = "{home}"\nbashrc = "{root / "bashrc"}"\nlink_home = false\n\n'
+        '[[providers]]\nid = "relay"\nbase_url = "https://relay.example/v1"\n\n'
+        f'[providers.http_headers]\nAuthorization = "{secret}"\n'
+    )
+    out = run(["plan", "--spec", str(spec)], expect_ok=False)
+    assert "literal sensitive header" in out, out
+    assert secret not in out, "a rejected header value leaked into diagnostics"
+
+    alternate_header = root / "alternate-header.toml"
+    alternate_header.write_text(
+        f'codex_home = "{home}"\nbashrc = "{root / "bashrc"}"\nlink_home = false\n\n'
+        '[[providers]]\nid = "relay"\nbase_url = "https://relay.example/v1"\n\n'
+        '[providers.http_headers]\n"X-Goog-Api-Key" = "must-not-appear"\n'
+    )
+    out = run(["plan", "--spec", str(alternate_header)], expect_ok=False)
+    assert "literal sensitive header" in out and "must-not-appear" not in out, out
+
+    url_secret = root / "url-secret.toml"
+    url_secret.write_text(
+        f'codex_home = "{home}"\nbashrc = "{root / "bashrc"}"\nlink_home = false\n\n'
+        '[[providers]]\nid = "relay"\nbase_url = "https://user:must-not-appear@relay.example/v1"\n'
+    )
+    out = run(["plan", "--spec", str(url_secret)], expect_ok=False)
+    assert "username/password" in out, out
+    assert "must-not-appear" not in out, "URL credentials leaked into diagnostics"
+
+    query_secret = root / "query-secret.toml"
+    query_secret.write_text(
+        f'codex_home = "{home}"\nbashrc = "{root / "bashrc"}"\nlink_home = false\n\n'
+        '[[providers]]\nid = "relay"\n'
+        'base_url = "https://relay.example/v1?client_secret=must-not-appear"\n'
+    )
+    out = run(["plan", "--spec", str(query_secret)], expect_ok=False)
+    assert "credential-like query" in out and "must-not-appear" not in out, out
+    print("  literal header, URL, and query credentials are rejected without echoing values")
+
+
+def check_environment_headers_and_redacted_plan(root: Path) -> None:
+    """Environment-backed secrets are allowed while JSON plans hide rendered content."""
+    home = fake_home(root)
+    spec = root / "env-header.toml"
+    marker = "trace-value-not-for-plan-output"
+    spec.write_text(
+        f'codex_home = "{home}"\nbashrc = "{root / "bashrc"}"\nlink_home = false\n\n'
+        '[[providers]]\nid = "relay"\nbase_url = "https://relay.example/v1"\n\n'
+        f'[providers.http_headers]\n"X-Trace" = "{marker}"\n\n'
+        '[providers.env_http_headers]\nAuthorization = "RELAY_AUTH_HEADER"\n'
+    )
+    planned = json.loads(run(["plan", "--json", "--spec", str(spec)]))
+    assert marker not in json.dumps(planned), "rendered provider content leaked into JSON plan"
+    assert all("content" not in change for change in planned["changes"]), planned
+    assert any("content_sha256" in change for change in planned["changes"]), planned
+
+    run(["apply", "--spec", str(spec), "--migrator", "/nonexistent/x.py"])
+    with (home / "relay.config.toml").open("rb") as stream:
+        profile = tomllib.load(stream)
+    provider = profile["model_providers"]["shared"]
+    assert provider["http_headers"] == {"X-Trace": marker}
+    assert provider["env_http_headers"] == {"Authorization": "RELAY_AUTH_HEADER"}
+    print("  env-backed sensitive headers work; JSON plans expose hashes, not content")
+
+
 def main() -> int:
     checks = [
         check_plan_is_readonly,
+        check_fresh_home_created,
+        check_non_directory_home_rejected,
         check_apply,
         check_idempotent,
         check_template_has_safe_timeless_defaults,
@@ -346,6 +449,8 @@ def main() -> int:
         check_symlink_never_stolen,
         check_stray_key_rejected,
         check_passthrough_table,
+        check_sensitive_provider_values_rejected,
+        check_environment_headers_and_redacted_plan,
     ]
     for check in checks:
         with tempfile.TemporaryDirectory() as tmp:

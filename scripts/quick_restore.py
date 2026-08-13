@@ -182,6 +182,7 @@ def print_check(payload: Dict[str, Any], args: argparse.Namespace) -> None:
 def print_restore(payload: Dict[str, Any]) -> None:
     audit = payload.get("audit") or {}
     deferred = payload.get("deferred_live_sessions") or []
+    deferred_reasons = payload.get("deferred_live_reasons") or {}
     if deferred:
         print(f"Session restore partially complete: {len(deferred)} live session(s) deferred.")
     elif payload.get("backup"):
@@ -191,10 +192,14 @@ def print_restore(payload: Dict[str, Any]) -> None:
     print_counts(audit)
     backup = payload.get("backup")
     print(f"Backup: {backup or 'not created (no changes)'}")
+    postconditions = payload.get("postconditions") or {}
+    if postconditions.get("verified"):
+        print("Verification: structural, provider, rollout, and backup checks passed")
     if deferred:
         print("Deferred files:")
         for path in deferred:
-            print(f"  - {path}")
+            reason = deferred_reasons.get(path, "live-or-uncertain")
+            print(f"  - {path} ({reason})")
         print("Close those Codex sessions, then run this command again.")
 
 

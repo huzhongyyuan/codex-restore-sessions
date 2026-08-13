@@ -6,8 +6,8 @@ stable public API guarantees.
 Start with:
 
 ```bash
-python3 scripts/session_guard.py --codex-home <candidate> capabilities
-python3 scripts/session_guard.py --codex-home <confirmed-home> --compact audit
+python3 "$SKILL_DIR/scripts/session_guard.py" --codex-home <candidate> capabilities
+python3 "$SKILL_DIR/scripts/session_guard.py" --codex-home <confirmed-home> --compact audit
 ```
 
 `capabilities` reports Python/TOML/SQLite versions, lock availability, home existence, discovered

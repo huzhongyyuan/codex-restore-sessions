@@ -1,6 +1,6 @@
 ---
 name: codex-restore-sessions
-description: Safely diagnose, preview, repair, migrate, and provision local Codex session state across providers, profiles, Codex homes, hosts, operating systems, and CLI versions. Use when sessions disappear or cannot resume; SQLite and rollout JSONL disagree; provider/profile changes hide history; names or archive state need recovery; rows reference missing rollout files; sessions must move to another home or machine; multiple provider profiles should share history; VS Code and the CLI see different sessions; or a new Codex host needs equivalent provider profiles without copying credentials.
+description: Restore missing or unresumable local Codex sessions safely across provider, profile, relay, home-directory, host, and CLI changes. Use when session history disappears; SQLite and rollout JSONL disagree; names or archive state need recovery; rows reference missing files; histories must migrate; profiles should share sessions; VS Code and CLI homes differ; or a new host needs equivalent provider profiles without copying credentials.
 ---
 
 # Restore Codex Sessions
@@ -11,6 +11,10 @@ recency, and archive state unless the user explicitly requests a supported chang
 
 Python 3.9+ is supported. Python 3.9/3.10 needs `tomli` from `requirements.txt`. Linux and macOS
 support guarded mutations; run `capabilities` before assuming mutation support on another platform.
+
+Resolve `SKILL_DIR` to the absolute directory containing this `SKILL.md`. Invoke every bundled
+script through `$SKILL_DIR/scripts/...`; never assume the user's current working directory is the
+skill directory.
 
 ## Select The Workflow
 
@@ -34,8 +38,8 @@ Use the short entry point for the common local case. It resolves `CODEX_HOME`, o
 the guarded engine.
 
 ```bash
-python3 scripts/quick_restore.py --check  # read-only
-python3 scripts/quick_restore.py          # guarded restore
+python3 "$SKILL_DIR/scripts/quick_restore.py" --check  # read-only
+python3 "$SKILL_DIR/scripts/quick_restore.py"          # guarded restore
 ```
 
 Add `--profile <name>` when the user runs `codex -p <name>`. Use `--codex-home <path>` only when
@@ -49,7 +53,7 @@ On an unfamiliar host, run this before touching session state. It succeeds even 
 home does not exist.
 
 ```bash
-python3 scripts/session_guard.py --codex-home <candidate-home> capabilities
+python3 "$SKILL_DIR/scripts/session_guard.py" --codex-home <candidate-home> capabilities
 ```
 
 Resolve the canonical home from `CODEX_HOME`, otherwise `${HOME}/.codex`, unless the user names a
@@ -61,7 +65,7 @@ different home. Confirm the absolute path. If the user invokes Codex with `-p <n
 Use doctor for a read-only health verdict and structured next-step recommendation:
 
 ```bash
-python3 scripts/session_guard.py --codex-home <absolute-home> doctor
+python3 "$SKILL_DIR/scripts/session_guard.py" --codex-home <absolute-home> doctor
 ```
 
 Recommendations are advisory and never auto-execute. When the user asked only for diagnosis, report
@@ -71,7 +75,7 @@ blocker.
 Use plan when the target provider, model, or deep rollout impact should be previewed:
 
 ```bash
-python3 scripts/session_guard.py --codex-home <absolute-home> --compact \
+python3 "$SKILL_DIR/scripts/session_guard.py" --codex-home <absolute-home> --compact \
   plan --provider <id> --deep
 ```
 
@@ -83,12 +87,13 @@ blockers. Do not mutate when `safe_to_apply` is false.
 For advanced automation or an explicit target provider, call the guarded engine directly:
 
 ```bash
-python3 scripts/session_guard.py --codex-home <absolute-home> --compact restore
+python3 "$SKILL_DIR/scripts/session_guard.py" --codex-home <absolute-home> --compact restore
 ```
 
 Add the matching `--profile <name>` when restoring for `codex -p <name>`. Use an explicit
 `--provider` only when the user or a verified configuration supplies the target. `restore` always
-repairs every recognized provider metadata location and defers actively growing rollout files. Use
+repairs every recognized provider metadata location and defers open, growing, or uncertain rollout
+files. It deep-verifies all non-deferred provider records before returning success. Use
 the lower-level `switch` flags only for deliberate partial or fail-on-live behavior. Never pass
 `--model` unless the user explicitly requests rewriting historical model metadata.
 
@@ -101,6 +106,7 @@ Accept success only when:
 - `problems` is empty;
 - `threads == rollout_files`;
 - database and JSONL providers equal the target, except paths explicitly listed as deferred;
+- `postconditions.verified` is true;
 - a changed run returns a backup path (`backup: null` is a valid no-op).
 
 ## Stop Conditions

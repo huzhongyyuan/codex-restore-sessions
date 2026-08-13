@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -40,6 +41,31 @@ ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 APPROVAL_POLICIES = {"untrusted", "on-failure", "on-request", "never"}
 SANDBOX_MODES = {"read-only", "workspace-write", "danger-full-access"}
+SENSITIVE_HEADER_NAMES = {
+    "authorization",
+    "proxyauthorization",
+    "xapikey",
+    "apikey",
+    "xauthtoken",
+    "cookie",
+    "setcookie",
+}
+SENSITIVE_QUERY_NAMES = {
+    "apikey",
+    "accesskey",
+    "key",
+    "token",
+    "accesstoken",
+    "auth",
+    "authorization",
+    "clientsecret",
+    "credential",
+    "password",
+    "secret",
+    "secretkey",
+    "signature",
+    "sig",
+}
 
 # Keys accepted inside [model_providers.<id>] beyond the ones we render directly.
 # Anything else in a [[providers]] block is a typo, not config — fail loudly rather
@@ -113,6 +139,95 @@ def toml_value(value: object) -> str:
 def toml_key(key: str) -> str:
     """Bare key when possible, quoted otherwise (e.g. "model.v1")."""
     return key if re.fullmatch(r"[A-Za-z0-9_-]+", key) and not key[0].isdigit() else toml_string(key)
+
+
+def normalized_secret_name(value: object) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value).lower())
+
+
+def sensitive_header_name(value: object) -> bool:
+    normalized = normalized_secret_name(value)
+    return (
+        normalized in SENSITIVE_HEADER_NAMES
+        or "authorization" in normalized
+        or "apikey" in normalized
+        or normalized.endswith(("auth", "token", "secret", "cookie", "signature"))
+    )
+
+
+def sensitive_query_name(value: object) -> bool:
+    normalized = normalized_secret_name(value)
+    return (
+        normalized in SENSITIVE_QUERY_NAMES
+        or "apikey" in normalized
+        or normalized.endswith(("token", "secret", "password", "credential", "signature"))
+    )
+
+
+def validate_public_provider_config(
+    ident: str, base_url: str, extra: dict[str, object]
+) -> None:
+    """Reject literal credentials before they can enter plans, configs, or backups."""
+    if base_url != base_url.strip() or any(character.isspace() for character in base_url):
+        die(f"provider {ident}: base_url must not contain whitespace")
+    try:
+        parsed = urllib.parse.urlsplit(base_url)
+    except ValueError:
+        die(f"provider {ident}: base_url is malformed")
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        die(f"provider {ident}: base_url must be a complete http(s) URL")
+    if parsed.username is not None or parsed.password is not None:
+        die(f"provider {ident}: base_url must not contain username/password credentials")
+    sensitive_url_keys = sorted(
+        key
+        for key, _ in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        if sensitive_query_name(key)
+    )
+    if sensitive_url_keys:
+        die(
+            f"provider {ident}: base_url contains credential-like query key(s) "
+            f"{', '.join(sensitive_url_keys)}; inject secrets through environment variables"
+        )
+
+    literal_headers = extra.get("http_headers", {})
+    if not isinstance(literal_headers, dict):
+        die(f"provider {ident}: http_headers must be a TOML table")
+    sensitive_headers = sorted(
+        str(name)
+        for name in literal_headers
+        if sensitive_header_name(name)
+    )
+    if sensitive_headers:
+        die(
+            f"provider {ident}: literal sensitive header(s) {', '.join(sensitive_headers)} "
+            "are forbidden; use env_http_headers so values stay out of specs and plans"
+        )
+
+    literal_query = extra.get("query_params", {})
+    if not isinstance(literal_query, dict):
+        die(f"provider {ident}: query_params must be a TOML table")
+    sensitive_query = sorted(
+        str(name)
+        for name in literal_query
+        if sensitive_query_name(name)
+    )
+    if sensitive_query:
+        die(
+            f"provider {ident}: literal credential-like query key(s) "
+            f"{', '.join(sensitive_query)} are forbidden"
+        )
+
+    env_headers = extra.get("env_http_headers", {})
+    if not isinstance(env_headers, dict):
+        die(f"provider {ident}: env_http_headers must be a TOML table")
+    invalid_env_names = sorted(
+        str(value) for value in env_headers.values() if not ENV_KEY_RE.match(str(value))
+    )
+    if invalid_env_names:
+        die(
+            f"provider {ident}: env_http_headers values must be UPPER_SNAKE_CASE "
+            "environment variable names"
+        )
 
 
 def render_table(header: str, body: dict[str, object]) -> list[str]:
@@ -202,7 +317,7 @@ def load_spec(path: Path) -> Spec:
         seen.add(ident)
         base_url = str(entry.get("base_url") or "")
         if not base_url.startswith(("http://", "https://")):
-            die(f"provider {ident}: base_url must be an http(s) URL, got {base_url!r}")
+            die(f"provider {ident}: base_url must be an http(s) URL")
         env_key = str(entry.get("env_key") or "")
         if env_key and not ENV_KEY_RE.match(env_key):
             die(f"provider {ident}: env_key {env_key!r} must be UPPER_SNAKE_CASE")
@@ -233,6 +348,8 @@ def load_spec(path: Path) -> Spec:
         tables = entry.get("tables") or {}
         if not isinstance(tables, dict):
             die(f"provider {ident}: `tables` must be a table of tables")
+        extra = {k: v for k, v in entry.items() if k in PROVIDER_PASSTHROUGH}
+        validate_public_provider_config(ident, base_url, extra)
         providers.append(
             Provider(
                 ident=ident,
@@ -246,7 +363,7 @@ def load_spec(path: Path) -> Spec:
                 model_reasoning_effort=str(entry.get("model_reasoning_effort") or ""),
                 model_verbosity=str(entry.get("model_verbosity") or ""),
                 requires_openai_auth=bool(entry.get("requires_openai_auth", True)),
-                extra={k: v for k, v in entry.items() if k in PROVIDER_PASSTHROUGH},
+                extra=extra,
                 profile_extra={k: v for k, v in entry.items() if k in PROFILE_PASSTHROUGH},
                 tables=dict(tables),
             )
@@ -466,7 +583,7 @@ def render_base_config(source: str, spec: Spec) -> str:
 
 @dataclass
 class Change:
-    kind: str            # write | bashrc | symlink | migrate
+    kind: str            # mkdir | write | bashrc | symlink | migrate
     path: str
     reason: str
     content: str | None = None
@@ -538,11 +655,19 @@ def build_plan(spec: Spec) -> tuple[list[Change], list[Gap]]:
     gaps: list[Gap] = []
     home = spec.codex_home
 
-    if not home.is_dir():
+    if not home.exists():
+        changes.append(
+            Change(
+                kind="mkdir",
+                path=str(home),
+                reason="create the configured Codex home with owner-only permissions",
+            )
+        )
+    elif not home.is_dir():
         gaps.append(
             Gap(
-                f"codex home {home} does not exist",
-                "run codex once to create it, or create the directory before applying",
+                f"codex home {home} is not a directory",
+                "choose an unused directory path or move the existing object aside",
             )
         )
 
@@ -554,7 +679,7 @@ def build_plan(spec: Spec) -> tuple[list[Change], list[Gap]]:
             Change(
                 kind="write",
                 path=str(path),
-                reason=f"profile for `codex -p {provider.ident}` -> {provider.base_url}",
+                reason=f"profile for `codex -p {provider.ident}`",
                 content=desired,
                 unchanged=current == desired,
             )
@@ -662,18 +787,45 @@ def build_plan(spec: Spec) -> tuple[list[Change], list[Gap]]:
 
 def backup_dir(home: Path) -> Path:
     root = home / "backups"
+    root_existed = root.exists()
     root.mkdir(parents=True, exist_ok=True)
+    if not root_existed:
+        fsync_directory(home)
     stamp = time.strftime("%Y%m%dT%H%M%S")
-    return Path(tempfile.mkdtemp(prefix=f"provision-{stamp}-", dir=root))
+    created = Path(tempfile.mkdtemp(prefix=f"provision-{stamp}-", dir=root))
+    fsync_directory(root)
+    return created
+
+
+def fsync_directory(path: Path) -> None:
+    directory_fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def fsync_file(path: Path) -> None:
+    with path.open("rb") as stream:
+        os.fsync(stream.fileno())
 
 
 def atomic_write(path: Path, content: str, mode: int | None = None) -> None:
-    tmp = path.with_name(path.name + ".provision.tmp")
-    tmp.write_text(content)
-    if mode is None:
-        mode = (path.stat().st_mode & 0o777) if path.exists() else 0o644
-    os.chmod(tmp, mode)
-    os.replace(tmp, path)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.provision-", dir=path.parent)
+    temp = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if mode is None:
+            mode = (path.stat().st_mode & 0o777) if path.exists() else 0o644
+        os.chmod(temp, mode)
+        fsync_file(temp)
+        os.replace(temp, path)
+        fsync_directory(path.parent)
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def validate_toml(path: Path) -> None:
@@ -692,6 +844,9 @@ def find_migrator(explicit: str | None) -> Path | None:
         here.parent / "session_guard.py",
         # Installed as a separate sibling skill.
         here.parent.parent.parent / "codex-restore-sessions" / "scripts" / "session_guard.py",
+        Path.home() / ".agents" / "skills" / "codex-restore-sessions" / "scripts"
+        / "session_guard.py",
+        # Legacy personal skill location used by earlier releases.
         Path.home() / ".codex" / "skills" / "codex-restore-sessions" / "scripts"
         / "session_guard.py",
     ]
@@ -726,6 +881,8 @@ def run_migration(spec: Spec, migrator: Path, skip_live: bool) -> dict[str, obje
 def apply_plan(
     spec: Spec, changes: list[Change], migrator: Path | None, skip_live: bool
 ) -> dict[str, object]:
+    if spec.codex_home.exists() and not spec.codex_home.is_dir():
+        die(f"configured Codex home is not a directory: {spec.codex_home}")
     backups: Path | None = None
     applied: list[dict[str, str]] = []
 
@@ -734,7 +891,18 @@ def apply_plan(
             applied.append({"path": change.path, "action": "already correct"})
             continue
 
-        if change.kind in {"write", "bashrc"}:
+        if change.kind == "mkdir":
+            path = Path(change.path)
+            try:
+                path.mkdir(parents=True, mode=0o700, exist_ok=False)
+            except FileExistsError:
+                die(f"configured Codex home appeared after planning; review before retrying: {path}")
+            os.chmod(path, 0o700)
+            fsync_directory(path)
+            fsync_directory(path.parent)
+            applied.append({"path": change.path, "action": "created directory (0700)"})
+
+        elif change.kind in {"write", "bashrc"}:
             path = Path(change.path)
             if path.exists():
                 if backups is None:
@@ -742,6 +910,8 @@ def apply_plan(
                 suffix = hashlib.sha256(str(path).encode()).hexdigest()[:12]
                 saved = backups / f"{path.name}.{suffix}"
                 shutil.copy2(path, saved)
+                fsync_file(saved)
+                fsync_directory(saved.parent)
             else:
                 saved = None
             assert change.content is not None
@@ -782,6 +952,7 @@ def apply_plan(
                 applied.append({"path": change.path, "action": "skipped (real path exists)"})
                 continue
             link.symlink_to(change.target)
+            fsync_directory(link.parent)
             applied.append(
                 {"path": change.path, "action": f"symlinked -> {change.target}"}
             )
@@ -995,6 +1166,7 @@ def describe_plan(changes: list[Change], gaps: list[Gap]) -> str:
     lines.append(f"{len(todo)} change(s) to apply, {len(same)} already correct\n")
     for change in todo:
         verb = {
+            "mkdir": "mkdir   ",
             "write": "write   ",
             "bashrc": "splice  ",
             "symlink": "symlink ",
@@ -1015,6 +1187,22 @@ def describe_plan(changes: list[Change], gaps: list[Gap]) -> str:
     return "\n".join(lines)
 
 
+def public_change(change: Change) -> dict[str, object]:
+    """Describe a plan without echoing rendered config or header values."""
+    result: dict[str, object] = {
+        "kind": change.kind,
+        "path": change.path,
+        "reason": change.reason,
+        "target": change.target,
+        "unchanged": change.unchanged,
+    }
+    if change.content is not None:
+        encoded = change.content.encode()
+        result["content_bytes"] = len(encoded)
+        result["content_sha256"] = hashlib.sha256(encoded).hexdigest()
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=["plan", "apply", "verify"])
@@ -1024,7 +1212,7 @@ def main() -> int:
     parser.add_argument(
         "--no-skip-live",
         action="store_true",
-        help="fail instead of skipping rollout files a live codex is appending to",
+        help="fail instead of deferring open, growing, or uncertain rollout files",
     )
     args = parser.parse_args()
 
@@ -1042,7 +1230,7 @@ def main() -> int:
             print(
                 json.dumps(
                     {
-                        "changes": [c.__dict__ for c in changes],
+                        "changes": [public_change(c) for c in changes],
                         "gaps": [g.__dict__ for g in gaps],
                     },
                     indent=2,

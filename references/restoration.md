@@ -9,8 +9,8 @@ records, and `event_msg.payload.thread_settings.model_provider_id`. Preview a de
 the provider has drifted back after reindexing:
 
 ```bash
-python3 scripts/session_guard.py --codex-home <home> --compact plan --provider <id> --deep
-python3 scripts/session_guard.py --codex-home <home> --compact restore --provider <id>
+python3 "$SKILL_DIR/scripts/session_guard.py" --codex-home <home> --compact plan --provider <id> --deep
+python3 "$SKILL_DIR/scripts/session_guard.py" --codex-home <home> --compact restore --provider <id>
 ```
 
 Deep mode records every changed line in the manifest so rollback can restore it byte for byte.
@@ -19,10 +19,10 @@ Deep mode records every changed line in the manifest so rollback can restore it 
 ## Live Rollout Files
 
 A running session may append to its rollout file. Prefer waiting for it to exit. If the user wants
-the remaining sessions migrated now, defer only active files:
+the remaining sessions migrated now, defer open, growing, or uncertain files:
 
 ```bash
-python3 scripts/session_guard.py --codex-home <home> --compact restore --provider <id>
+python3 "$SKILL_DIR/scripts/session_guard.py" --codex-home <home> --compact restore --provider <id>
 ```
 
 Report every `deferred_live_sessions` path and rerun after those sessions exit.
@@ -31,7 +31,7 @@ Use `restore --fail-live` only when the user wants the entire run to fail instea
 ## Rename Repair
 
 ```bash
-python3 scripts/session_guard.py --codex-home <home> --compact repair
+python3 "$SKILL_DIR/scripts/session_guard.py" --codex-home <home> --compact repair
 ```
 
 Restore a legacy name only when the database name is empty, the legacy name equals the title, and
@@ -43,7 +43,7 @@ it differs from the first user message. Leave ambiguous names unchanged.
 sync cannot repair that. Explain which rows will disappear and obtain user intent before pruning:
 
 ```bash
-python3 scripts/session_guard.py --codex-home <home> --compact prune
+python3 "$SKILL_DIR/scripts/session_guard.py" --codex-home <home> --compact prune
 ```
 
 Prune only rows whose recorded file is still absent at mutation time. The command backs up the full
@@ -56,7 +56,7 @@ When profiles use distinct provider IDs, their resume lists may be disjoint. Pre
 then use one custom shared ID:
 
 ```bash
-python3 scripts/session_guard.py --codex-home <home> --compact unify --provider shared
+python3 "$SKILL_DIR/scripts/session_guard.py" --codex-home <home> --compact unify --provider shared
 ```
 
 `unify` backs up `config.toml` and every `*.config.toml`, preserves endpoint/auth fields and comments,
@@ -68,7 +68,7 @@ custom target. Never rewrite configs without migrating history in the same run.
 Roll back only a named backup under the same Codex home:
 
 ```bash
-python3 scripts/session_guard.py --codex-home <home> --compact \
+python3 "$SKILL_DIR/scripts/session_guard.py" --codex-home <home> --compact \
   rollback <home>/backups/session-guard-<timestamp>
 ```
 

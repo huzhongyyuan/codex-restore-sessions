@@ -9,6 +9,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import session_guard as guard
+
 try:
     import tomllib
 except ModuleNotFoundError:  # Python 3.10
@@ -179,7 +181,10 @@ def main() -> None:
     check_profiles()
     check_prune()
     check_skip_live()
+    check_idle_open_deferred()
+    check_unavailable_open_detector_defers()
     check_deep_switch()
+    check_postcondition_rejects_stale_deep_provider()
     check_unify()
     check_migration()
     check_quick_restore()
@@ -329,6 +334,12 @@ def check_skip_live() -> None:
         assert result["deferred_live_sessions"] == [str(busy.resolve())], result[
             "deferred_live_sessions"
         ]
+        reason = result["deferred_live_reasons"][str(busy.resolve())]
+        assert reason == "growing" or reason == "changed-since-audit" or reason.startswith(
+            "open-file:"
+        ), reason
+        assert result["postconditions"]["verified"] is True
+        assert result["postconditions"]["deferred_sessions_preserved"] == 1
         rows = dict(
             sqlite3.connect(home / "state_5.sqlite")
             .execute("select id, model_provider from threads")
@@ -345,12 +356,83 @@ def check_skip_live() -> None:
         # Once the writer is gone the rerun finishes the job.
         finished = run(home, "--compact", "restore", "--provider", "shared")
         assert finished["deferred_live_sessions"] == []
+        assert finished["postconditions"]["rollout_files_deep_verified"] == 2
         rows = dict(
             sqlite3.connect(home / "state_5.sqlite")
             .execute("select id, model_provider from threads")
             .fetchall()
         )
         assert rows == {"idle": "shared", "busy": "shared"}, rows
+
+
+def check_idle_open_deferred() -> None:
+    """An open rollout is deferred even while it is not actively growing."""
+    with tempfile.TemporaryDirectory() as raw:
+        home = Path(raw)
+        idle_open = home / "sessions/2026/01/01/rollout-idle-open.jsonl"
+        rollout(idle_open, "idle-open", "old")
+        (home / "config.toml").write_text('model_provider = "new"\n')
+        make_db(
+            home,
+            [("idle-open", str(idle_open), 0, None, "old", "m", "", "t", "u", "p")],
+        )
+        holder = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import sys,time\n"
+                "stream=open(sys.argv[1],'ab',buffering=0)\n"
+                "print('ready',flush=True)\n"
+                "time.sleep(25)\n",
+                str(idle_open),
+            ],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert holder.stdout is not None and holder.stdout.readline().strip() == "ready"
+            failed = run_fail(home, "--compact", "restore", "--provider", "new", "--fail-live")
+            assert "live or uncertain" in failed, failed
+            result = run(home, "--compact", "restore", "--provider", "new")
+        finally:
+            holder.terminate()
+            holder.wait()
+
+        resolved = str(idle_open.resolve())
+        assert result["deferred_live_sessions"] == [resolved], result
+        assert result["deferred_live_reasons"][resolved].startswith("open-file:"), result
+        provider = sqlite3.connect(home / "state_5.sqlite").execute(
+            "select model_provider from threads where id='idle-open'"
+        ).fetchone()[0]
+        assert provider == "old", "an idle-open session must remain byte-for-byte deferred"
+
+        finished = run(home, "--compact", "restore", "--provider", "new")
+        assert finished["deferred_live_sessions"] == []
+        assert finished["postconditions"]["verified"] is True
+
+
+def check_unavailable_open_detector_defers() -> None:
+    """No detector is treated as uncertainty, never as proof that a file is closed."""
+    with tempfile.TemporaryDirectory() as raw:
+        path = (Path(raw) / "rollout-uncertain.jsonl").resolve()
+        rollout(path, "uncertain", "old")
+        stat = path.stat()
+        context = {
+            "metadata": {
+                str(path): (
+                    b"",
+                    {},
+                    (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns),
+                )
+            }
+        }
+        original = guard.open_rollout_paths
+        guard.open_rollout_paths = lambda targets: (set(), None)
+        try:
+            reasons = guard.live_rollout_reasons(context, settle_seconds=0)
+        finally:
+            guard.open_rollout_paths = original
+        assert reasons == {str(path): "open-state-unknown"}, reasons
 
 
 def deep_rollout(path: Path, thread_id: str, provider: str, extra_meta: bool = True) -> list[str]:
@@ -435,6 +517,8 @@ def check_deep_switch() -> None:
         assert providers_in(one) == {"shared", "OpenAI"}, providers_in(one)
 
         result = run(home, "--compact", "restore", "--provider", "shared", "--fail-live")
+        assert result["postconditions"]["verified"] is True
+        assert result["postconditions"]["database_rows_verified"] == 2
         assert providers_in(one) == {"shared"}, providers_in(one)
         assert providers_in(two) == {"shared"}, providers_in(two)
 
@@ -459,6 +543,36 @@ def check_deep_switch() -> None:
             .fetchall()
         )
         assert rows == {"one": 0, "two": 1}, rows
+
+
+def check_postcondition_rejects_stale_deep_provider() -> None:
+    """A stale nested provider record can never be reported as restored."""
+    with tempfile.TemporaryDirectory() as raw:
+        home = Path(raw).resolve()
+        path = home / "sessions/2026/01/01/rollout-stale.jsonl"
+        deep_rollout(path, "stale", "old")
+        lines = path.read_text().splitlines()
+        first = json.loads(lines[0])
+        first["payload"]["model_provider"] = "new"
+        lines[0] = json.dumps(first)
+        path.write_text("\n".join(lines) + "\n")
+        (home / "config.toml").write_text('model_provider = "new"\n')
+        make_db(home, [("stale", str(path), 0, None, "new", "m", "", "t", "u", "p")])
+        report, context = guard.audit(home)
+        try:
+            guard.verify_restore_postconditions(
+                home,
+                report,
+                context,
+                "new",
+                set(),
+                {"rows": {}, "provider_lines": {}},
+                None,
+            )
+        except SystemExit as exc:
+            assert "rollout provider mismatch" in str(exc), exc
+        else:
+            raise AssertionError("stale deep provider record passed restore postconditions")
 
 
 def check_unify() -> None:
@@ -685,6 +799,7 @@ def check_quick_restore() -> None:
         restored = run_quick(home)
         assert restored.returncode == 0, restored.stderr
         assert "Session restore complete" in restored.stdout, restored.stdout
+        assert "Verification: structural, provider, rollout, and backup checks passed" in restored.stdout
         assert "provider=new" in restored.stdout, restored.stdout
         assert "Sessions: 1 (1 active, 0 archived); rollouts=1" in restored.stdout
         provider = sqlite3.connect(home / "state_5.sqlite").execute(
@@ -697,6 +812,7 @@ def check_quick_restore() -> None:
         payload = json.loads(unchanged.stdout)
         assert payload["backup"] is None, payload
         assert payload["audit"]["problems"] == {}, payload
+        assert payload["postconditions"]["verified"] is True
 
 
 def make_db(home: Path, rows: list[tuple]) -> None:
