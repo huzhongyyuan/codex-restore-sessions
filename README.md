@@ -12,7 +12,37 @@
 搭建脚本会调用 session 脚本完成历史迁移，所以新机器只需要跑 `provision_codex.py`。
 安装本身没问题、只是 session 不对时，直接用 `session_guard.py`。
 
-两者都不复制凭据。所有修改在本地完成，写入前创建经过校验的增量备份与操作 journal。
+两者都不复制凭据。session 工具不打开凭据文件；provision 工具只检查 key 文件的类型和权限，
+不读取内容。所有修改在本地完成，写入前创建经过校验的增量备份与操作 journal。
+
+## 30 秒安装与更新
+
+首次安装：
+
+```bash
+git clone --depth 1 https://github.com/huzhongyyuan/codex-restore-sessions.git \
+  "${CODEX_HOME:-$HOME/.codex}/skills/codex-restore-sessions"
+```
+
+以后更新：
+
+```bash
+git -C "${CODEX_HOME:-$HOME/.codex}/skills/codex-restore-sessions" pull --ff-only
+```
+
+使用 Python 3.9/3.10 时，再安装一次兼容依赖：
+
+```bash
+python3 -m pip install -r \
+  "${CODEX_HOME:-$HOME/.codex}/skills/codex-restore-sessions/requirements.txt"
+```
+
+重启 Codex 后，普通使用只需要说“检查我的 sessions”或“恢复所有旧 sessions”。命令行对应为：
+
+```bash
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/codex-restore-sessions/scripts/session_guard.py" doctor
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/codex-restore-sessions/scripts/session_guard.py" --compact restore
+```
 
 > 关于 Codex 内部行为的结论（resume 的过滤字段、rollout 文件里 provider 的记录位置、
 > `[projects]` 遮蔽 profile 顶层键）来自对 **codex-cli 0.144.3** 的黑盒实验和 `strings`
@@ -25,7 +55,7 @@
 - `state_*.sqlite` 与 `sessions/**/*.jsonl` 中的 provider 不一致
 - 同一台机器上多个 provider profile（`codex -p relay` / `codex -p gateway`）各自记录 session，
   想让它们共享同一份历史 → 一条 `unify` 命令，见[让多个 provider 共享同一份 session](#让多个-provider-共享同一份-session新服务器一条命令)
-- 明明改过 provider，下一次 reindex 又漂回旧值 → 需要 `switch --deep`
+- 明明改过 provider，下一次 reindex 又漂回旧值 → 用一键 `restore`
 - VS Code 插件里一条 session 都看不到 → 见[VS Code 插件看不到 session](#vs-code-插件看不到-session)
 - 数据库中残留指向已删除 rollout 文件的孤儿行，导致其他模式全部拒绝执行
 - Codex 升级、切换 home 目录后需要审计现有 session
@@ -36,7 +66,7 @@
 ## 在新机器上搭一套
 
 ```bash
-cp reference/spec.example.toml my-host.toml   # 改 base_url / key 路径
+cp assets/spec.example.toml my-host.toml   # 改 base_url / key 路径
 python3 scripts/provision_codex.py plan   --spec my-host.toml   # 只看，不改
 python3 scripts/provision_codex.py apply  --spec my-host.toml
 python3 scripts/provision_codex.py verify --spec my-host.toml
@@ -56,7 +86,7 @@ umask 077
 printf '{"OPENAI_API_KEY": "<key>"}\n' > ~/.codex-providers/relay/auth.json
 ```
 
-它产出：每个服务商一个 `$CODEX_HOME/<id>.config.toml`（→ `codex -p <id>`）、`.bashrc` 里一个带
+它产出：每个服务商一个 `$CODEX_HOME/<id>.config.toml`（→ `codex -p <id>`）、shell rc 里一个带
 标记的 `codex-<id>` 包装函数块（调用时读 key、只注入给那一个进程）、所有 config 统一的
 provider id、base config 里的默认权限档位、以及 `codex_home` 不在 `$HOME` 时的
 `$HOME/.codex` 软链接。历史迁移交给 `session_guard.py`，始终带 `--deep`。
@@ -66,6 +96,8 @@ key 文件缺失只报为 gap，不中断其余工作。已经指向别处的 `$
 ### 权限档位
 
 `approval_policy` + `sandbox_mode` 写在 base config，所有 profile 继承。
+
+通用模板默认使用 `on-request` + `workspace-write`，且不默认信任任何项目目录。
 
 - `never` + `workspace-write` —— 不再弹审批，但写入仍限于工作目录和 `/tmp`。
 - `never` + `danger-full-access` —— full access，无审批无沙箱。生成的命令可以读写你能读写的
@@ -105,9 +137,9 @@ Codex 启动横幅里的 `provider: <id>` 是 provider **id**，不是服务商�
 
 - 修改前审计，发现路径、ID、归档位置、重复项或 journal 异常时拒绝写入
 - 使用 SQLite backup API 创建一致的数据库备份并校验完整性与 SHA-256
-- 原子替换 rollout 元数据首行，保留其余 conversation events
+- 原子改写明确识别出的 provider 元数据，保留其余 conversation events
 - 修改期间加本地文件锁，并检测并发数据库或文件变化
-- provider 同步默认不改写历史 model、名称、时间戳和归档状态
+- provider 同步默认不改写历史 model、时间戳和归档状态；只修复无歧义的空名称
 - `prune` 只删除 rollout 文件确实不存在的行；文件仍在的行一律拒绝删除
 - 迁移 bundle 逐文件校验 SHA-256，目标 home 已有 session 时拒绝导入
 - 不读取、输出、散列、复制或备份 `auth.json`、API key、token 与凭据环境变量
@@ -115,15 +147,12 @@ Codex 启动横幅里的 `provider: <id>` 是 provider **id**，不是服务商�
 
 ## 安装
 
-需要 Python 3.10+。Python 3.11+ 无额外依赖；Python 3.10 需安装 `tomli`。Linux 和 macOS
+需要 Python 3.9+。Python 3.11+ 无额外依赖；Python 3.9/3.10 需安装 `tomli`。Linux 和 macOS
 支持审计与修改；Windows 当前仅支持审计，因为修改路径依赖 `fcntl` 文件锁。
 
-```bash
-git clone https://github.com/huzhongyyuan/codex-restore-sessions.git \
-  "${CODEX_HOME:-$HOME/.codex}/skills/codex-restore-sessions"
-```
+首次安装和更新命令见[30 秒安装与更新](#30-秒安装与更新)。
 
-仅使用 Python 3.10 时，再运行：
+使用 Python 3.9/3.10 时，再运行：
 
 ```bash
 python3 -m pip install -r \
@@ -146,6 +175,35 @@ Codex 会读取 `SKILL.md` 并使用受保护的默认流程。
 ```bash
 SKILL_DIR="${CODEX_HOME:-$HOME/.codex}/skills/codex-restore-sessions"
 CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
+```
+
+### 环境能力检查
+
+第一次在陌生主机上运行时，可先检查 Python、SQLite、锁能力和候选 home；即使 home 尚不存在也
+能执行：
+
+```bash
+python3 "$SKILL_DIR/scripts/session_guard.py" \
+  --codex-home "$CODEX_DIR" capabilities
+```
+
+### 只读变更预览
+
+`plan` 会报告预计影响的数据库行、rollout 文件与记录、名称修复候选和阻塞项，不创建备份或写入：
+
+```bash
+python3 "$SKILL_DIR/scripts/session_guard.py" \
+  --codex-home "$CODEX_DIR" --compact plan --provider shared --deep
+```
+
+### 一键只读诊断
+
+`doctor` 会把审计和深度预览整理成 `healthy`、`warning`、`action-recommended` 或 `blocked`，并
+返回结构化的下一步命令。建议只供展示，永远不会自动执行：
+
+```bash
+python3 "$SKILL_DIR/scripts/session_guard.py" \
+  --codex-home "$CODEX_DIR" doctor
 ```
 
 ### 新服务器上让多服务商共享 session
@@ -181,10 +239,11 @@ python3 "$SKILL_DIR/scripts/session_guard.py" \
 
 ```bash
 python3 "$SKILL_DIR/scripts/session_guard.py" \
-  --codex-home "$CODEX_DIR" --compact switch
+  --codex-home "$CODEX_DIR" --compact restore
 ```
 
-目标 provider 来自当前 `config.toml`。一次 `switch` 已包含：
+目标 provider 来自当前 `config.toml`。`restore` 默认深度修复所有已识别的 provider 元数据位置，
+并把仍在增长的 rollout 文件列入延期清单。一次 `restore` 已包含：
 
 1. 写入前完整审计
 2. 数据库一致性备份与 manifest
@@ -202,7 +261,7 @@ python3 "$SKILL_DIR/scripts/session_guard.py" \
 
 ```bash
 python3 "$SKILL_DIR/scripts/session_guard.py" \
-  --codex-home "$CODEX_DIR" --compact switch --provider openai
+  --codex-home "$CODEX_DIR" --compact restore --provider openai
 ```
 
 默认不会改写历史 model。只有明确需要时才传入 `--model`。
@@ -269,7 +328,7 @@ requires_openai_auth = true
 env_key = "..."                 # 各服务商不同;官方通道不写这行
 ```
 
-改完再跑 `switch --provider shared --deep`。
+改完再跑 `restore --provider shared`。
 
 #### provider 会"漂回去"：必须用 `--deep`
 
@@ -284,22 +343,22 @@ Codex 重建索引时读的是后两者，所以只改首行的话，下一次 r
 
 ```bash
 python3 "$SKILL_DIR/scripts/session_guard.py" \
-  --codex-home "$CODEX_DIR" --compact switch --provider shared --deep
+  --codex-home "$CODEX_DIR" --compact restore --provider shared
 ```
 
-`--deep` 是整文件重写（不是只换首行），所以每一条改动行的 before/after 都进 manifest，
+`restore` 自动使用深度模式（整文件受保护重写，而不是只换首行），所以每一条改动行的
+before/after 都进 manifest，
 `rollback` 能逐字节还原。已在 3 MB 的真实会话文件上验证过：改动仅限 provider 字段，
 回滚后与原文件 sha256 完全一致。
 
 #### 跳过正在写入的会话
 
 正在运行的 Codex 会话会持续往自己的 rollout 文件追加内容。改写走的是临时文件加 rename，
-审计与 rename 之间落下的追加会丢失，所以 `switch` 检测到文件变动就会整体拒绝执行。等那个会话
-结束再跑即可；不想等就用 `--skip-live`：
+审计与 rename 之间落下的追加会丢失。`restore` 默认检测并跳过仍在增长的文件：
 
 ```bash
 python3 "$SKILL_DIR/scripts/session_guard.py" \
-  --codex-home "$CODEX_DIR" --compact switch --provider shared --skip-live
+  --codex-home "$CODEX_DIR" --compact restore --provider shared
 ```
 
 活跃文件会被原样跳过（保留旧 provider），其余全部照常迁移，跳过的路径列在返回的
@@ -355,6 +414,9 @@ python3 "$SKILL_DIR/scripts/session_guard.py" \
 `session_index.jsonl`，以及通过 SQLite backup API 得到的一致数据库快照，另有 `bundle.json`
 记录每个文件的 SHA-256。
 
+导出路径必须在源 Codex home 之外。工具会先拒绝活跃 rollout、符号链接、特殊文件和疑似凭据文件，
+再在私有临时目录中构建并完整校验；只有全部成功才原子发布目标目录，失败不会留下半成品。
+
 **不会包含**：`auth.json`、API key、token、源端 `config.toml`、项目代码与数据集。目标机器必须
 用它自己的凭据登录；复制源端 `config.toml` 会把新机器指向它可能无权使用的 relay。
 
@@ -376,7 +438,7 @@ python3 "$SKILL_DIR/scripts/session_guard.py" \
 数据库中记录的源端绝对路径改写到本机 home，然后完整审计。改写只在译出的路径确实指向本 home
 内的真实文件时才保留。归档状态、session 名称、历史 model 全部原样保留。
 
-导入后如需把 session 同步到本机 provider，再跑一次 `switch`（可带 `--profile`）。
+导入后如需把 session 同步到本机 provider，再跑一次 `restore`（可带 `--profile`）。
 
 只想检查 bundle 而不写入任何东西：
 
@@ -390,8 +452,8 @@ SQLite/JSONL 状态的自动合并；直接覆盖会有数据丢失风险。
 
 ## 数据范围
 
-工具只读取 session 索引、SQLite thread 元数据、rollout JSONL 首条 `session_meta` 记录，以及
-`config.toml` 中用于识别 provider/relay 的非秘密字段。备份目录默认位于：
+工具只读取 session 索引、SQLite thread 元数据、rollout JSONL 中明确识别的 provider 元数据，
+以及 `config.toml` 中用于识别 provider/relay 的非秘密字段。备份目录默认位于：
 
 ```text
 $CODEX_HOME/backups/session-guard-<UTC timestamp>/
@@ -423,9 +485,9 @@ python3 scripts/test_session_guard.py     # session 修复
 python3 scripts/test_provision_codex.py   # 新机器搭建
 ```
 
-`test_session_guard.py` 完全在临时目录中运行，覆盖 audit、switch、rename、relay fingerprint、
+`test_session_guard.py` 完全在临时目录中运行，覆盖 doctor、plan、restore、audit、switch、rename、relay fingerprint、
 rollback、恶意 manifest 越界路径拒绝，以及 profile 叠加与继承、per-profile fingerprint、prune
-与其回滚、bundle 导出/校验/导入、凭据排除、非空目标拒绝和 bundle 篡改检测。
+与其回滚、事务式 bundle 导出/校验/导入、符号链接与凭据排除、非空目标拒绝和 bundle 篡改检测。
 
 新增覆盖：`--skip-live`（真起一个持续追加的写入进程，断言活跃文件保留旧 provider、其余照常迁移、
 写入方退出后重跑收尾）、`--deep`（重复 `session_meta` 加多条 `thread_settings` 的 fixture，断言
@@ -433,9 +495,11 @@ provider 全部清干净、非 provider 字段与非 ASCII 内容逐字节不变
 （带注释 / 无 provider 表 / 顶层键插入位置三种 config，断言 `base_url` 与 `env_key` 未被改动、
 注释保留、`[projects]` 没有吞掉新键、重跑是 no-op、保留 id `openai` 被拒绝）。
 
-`test_provision_codex.py` 11 项，同样只在临时目录里跑，断言 `plan` 不写文件、生成的 config 与
-`.bashrc` 里不含密钥值、重跑幂等且包装函数不重复、保留 id 与 `CODEX_API_KEY` 被拒绝、缺 key
-文件只报 gap、权限过松的 key 文件被标记。其中两条是回归测试：`$HOME/.codex` 已指向别处时必须
+`test_provision_codex.py` 同样只在临时目录里跑，断言 `plan` 不写文件、生成的 config 与
+shell rc 里不含密钥值、规划时不打开凭据内容、无操作运行不创建空备份、模板不固定模型版本、
+重跑幂等且包装函数不重复、保留 id 与
+`CODEX_API_KEY` 被拒绝、缺 key 文件只报 gap、异常权限被标记。其中两条是回归测试：
+`$HOME/.codex` 已指向别处时必须
 拒绝而不是抢占（早期版本会直接重指，测试中曾误伤真实软链接）；写在 `[[providers]]` 之后的顶层键
 在 TOML 里属于该块，必须报错而不是被当成 provider 配置写进去。
 
@@ -445,8 +509,9 @@ provider 全部清干净、非 provider 字段与非 ASCII 内容逐字节不变
 .
 ├── SKILL.md
 ├── agents/openai.yaml
-├── reference/
-│   └── spec.example.toml          # 新机器 spec 模板（只含路径，不含密钥）
+├── assets/
+│   └── spec.example.toml          # 安全默认值的新机器模板（只含路径，不含密钥）
+├── references/                    # 按场景加载的恢复、迁移、配置和兼容说明
 └── scripts/
     ├── provision_codex.py         # 搭建：profile / 包装函数 / 权限 / 软链接
     ├── test_provision_codex.py

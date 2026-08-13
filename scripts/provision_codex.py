@@ -11,23 +11,26 @@ Never handles secret values. Key files are checked for presence and mode only.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 try:
     import tomllib
-except ModuleNotFoundError:  # Python 3.10
+except ModuleNotFoundError:  # Python 3.9 and 3.10
     try:
         import tomli as tomllib  # type: ignore[no-redef]
     except ModuleNotFoundError:
-        sys.exit("Python 3.11+, or `pip install tomli` on 3.10, is required.")
+        sys.exit("Python 3.9+ is required; on Python 3.9/3.10 run `pip install tomli`.")
 
 OFFICIAL_BASE_URL = "https://chatgpt.com/backend-api/codex"
 RESERVED_PROVIDER_IDS = {"openai"}
@@ -58,6 +61,7 @@ SPEC_KEYS = {
     "sandbox_mode",
     "trusted_projects",
     "bashrc",
+    "shell_rc",
     "link_home",
     "official",
     "providers",
@@ -107,7 +111,7 @@ def toml_value(value: object) -> str:
 
 
 def toml_key(key: str) -> str:
-    """Bare key when possible, quoted otherwise (e.g. "gpt-5.6-sol")."""
+    """Bare key when possible, quoted otherwise (e.g. "model.v1")."""
     return key if re.fullmatch(r"[A-Za-z0-9_-]+", key) and not key[0].isdigit() else toml_string(key)
 
 
@@ -248,7 +252,14 @@ def load_spec(path: Path) -> Spec:
             )
         )
 
-    bashrc = expand(str(raw["bashrc"])) if raw.get("bashrc") else Path.home() / ".bashrc"
+    if raw.get("bashrc") and raw.get("shell_rc"):
+        die("use only one of shell_rc or the legacy bashrc key")
+    configured_rc = raw.get("shell_rc") or raw.get("bashrc")
+    if configured_rc:
+        shell_rc = expand(str(configured_rc))
+    else:
+        shell_name = Path(os.environ.get("SHELL", "")).name
+        shell_rc = Path.home() / (".zshrc" if shell_name == "zsh" else ".bashrc")
     return Spec(
         codex_home=codex_home,
         shared_provider_id=shared,
@@ -258,7 +269,7 @@ def load_spec(path: Path) -> Spec:
         trusted_projects=[expand(str(p)) for p in (raw.get("trusted_projects") or [])],
         official=dict(raw.get("official") or {}),
         manage_official="official" in raw,
-        bashrc=bashrc,
+        bashrc=shell_rc,
         link_home=bool(raw.get("link_home", True)),
     )
 
@@ -483,7 +494,7 @@ def splice_block(source: str, block: str) -> str:
 
 
 def check_key_file(provider: Provider) -> Gap | None:
-    """Presence, JSON shape, and mode — never the value."""
+    """Check only presence, file type, and mode; never open credential contents."""
     path = provider.key_file
     if path is None:
         return None
@@ -494,23 +505,32 @@ def check_key_file(provider: Provider) -> Gap | None:
             f'{{"{provider.key_json_field}": "<key>"}}  '
             f"(mkdir -p {path.parent} && umask 077)",
         )
+    if not path.is_file():
+        return Gap(
+            f"key path for {provider.ident} is not a regular file",
+            f"replace {path} with a 0600 JSON file containing {provider.key_json_field}",
+        )
     mode = path.stat().st_mode & 0o777
+    if not mode & 0o400:
+        return Gap(
+            f"key file for {provider.ident} is not owner-readable",
+            f"chmod 600 {path}  (currently {mode:04o})",
+        )
     if mode & 0o077:
         return Gap(
             f"key file for {provider.ident} is world/group readable",
             f"chmod 600 {path}  (currently {mode:04o})",
         )
-    try:
-        with path.open("rb") as stream:
-            data = json.load(stream)
-    except (OSError, json.JSONDecodeError) as exc:
-        return Gap(f"key file for {provider.ident} is not readable JSON", f"{path}: {exc}")
-    if not isinstance(data, dict) or not data.get(provider.key_json_field):
-        return Gap(
-            f"key file for {provider.ident} lacks {provider.key_json_field}",
-            f"{path} must be an object with a non-empty {provider.key_json_field}",
-        )
     return None
+
+
+def has_session_state(home: Path) -> bool:
+    if any(home.glob("state_*.sqlite")):
+        return True
+    return any(
+        folder.exists() and next(folder.rglob("rollout-*.jsonl"), None) is not None
+        for folder in (home / "sessions", home / "archived_sessions")
+    )
 
 
 def build_plan(spec: Spec) -> tuple[list[Change], list[Gap]]:
@@ -620,14 +640,18 @@ def build_plan(spec: Spec) -> tuple[list[Change], list[Gap]]:
                 )
             )
 
+    state_present = has_session_state(home)
     changes.append(
         Change(
             kind="migrate",
             path=str(home),
             reason=(
                 f"retarget existing sessions to {spec.shared_provider_id!r} with --deep so all "
-                "three provider fields per rollout are rewritten"
+                "provider metadata locations are rewritten"
+                if state_present
+                else "no existing session state to migrate"
             ),
+            unchanged=not state_present,
         )
     )
     return changes, gaps
@@ -637,10 +661,10 @@ def build_plan(spec: Spec) -> tuple[list[Change], list[Gap]]:
 
 
 def backup_dir(home: Path) -> Path:
+    root = home / "backups"
+    root.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%dT%H%M%S")
-    path = home / "backups" / f"provision-{stamp}"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+    return Path(tempfile.mkdtemp(prefix=f"provision-{stamp}-", dir=root))
 
 
 def atomic_write(path: Path, content: str, mode: int | None = None) -> None:
@@ -684,13 +708,12 @@ def run_migration(spec: Spec, migrator: Path, skip_live: bool) -> dict[str, obje
         "--codex-home",
         str(spec.codex_home),
         "--compact",
-        "switch",
+        "restore",
         "--provider",
         spec.shared_provider_id,
-        "--deep",
     ]
-    if skip_live:
-        command.append("--skip-live")
+    if not skip_live:
+        command.append("--fail-live")
     proc = subprocess.run(command, capture_output=True, text=True, timeout=1800)
     tail = (proc.stdout or proc.stderr or "").strip().splitlines()[-25:]
     return {
@@ -703,7 +726,7 @@ def run_migration(spec: Spec, migrator: Path, skip_live: bool) -> dict[str, obje
 def apply_plan(
     spec: Spec, changes: list[Change], migrator: Path | None, skip_live: bool
 ) -> dict[str, object]:
-    backups = backup_dir(spec.codex_home)
+    backups: Path | None = None
     applied: list[dict[str, str]] = []
 
     for change in changes:
@@ -714,7 +737,10 @@ def apply_plan(
         if change.kind in {"write", "bashrc"}:
             path = Path(change.path)
             if path.exists():
-                saved = backups / f"{path.name}.{abs(hash(str(path))) % 100000}"
+                if backups is None:
+                    backups = backup_dir(spec.codex_home)
+                suffix = hashlib.sha256(str(path).encode()).hexdigest()[:12]
+                saved = backups / f"{path.name}.{suffix}"
                 shutil.copy2(path, saved)
             else:
                 saved = None
@@ -760,12 +786,18 @@ def apply_plan(
                 {"path": change.path, "action": f"symlinked -> {change.target}"}
             )
 
-    result: dict[str, object] = {"backup_dir": str(backups), "applied": applied}
+    result: dict[str, object] = {
+        "backup_dir": str(backups) if backups is not None else None,
+        "applied": applied,
+    }
 
-    if migrator is None:
+    migration = next((change for change in changes if change.kind == "migrate"), None)
+    if migration is not None and migration.unchanged:
+        result["migration"] = {"skipped": "no existing session state to migrate"}
+    elif migrator is None:
         result["migration"] = {
             "skipped": "session_guard.py not found next to this script; pass "
-            "--migrator <path>, or migrate manually with `switch --provider <id> --deep`"
+            "--migrator <path>, or migrate manually with `restore --provider <id>`"
         }
     else:
         result["migration"] = run_migration(spec, migrator, skip_live)
@@ -776,6 +808,26 @@ def apply_plan(
 
 
 BANNER = re.compile(r"^(model|provider|approval|sandbox):[ \t]*(.+?)[ \t]*$")
+
+
+def find_thread_database(home: Path) -> Path | None:
+    """Find the newest usable state database without assuming a schema version."""
+    def version(path: Path) -> int:
+        match = re.fullmatch(r"state_(\d+)\.sqlite", path.name)
+        return int(match.group(1)) if match else -1
+
+    for path in sorted(home.glob("state_*.sqlite"), key=version, reverse=True):
+        try:
+            con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            present = con.execute(
+                "select 1 from sqlite_master where type='table' and name='threads'"
+            ).fetchone()
+            con.close()
+            if present:
+                return path
+        except sqlite3.Error:
+            continue
+    return None
 
 
 def probe_channel(
@@ -905,10 +957,8 @@ def verify(spec: Spec) -> dict[str, object]:
                 f"expected {provider.env_key!r}"
             )
 
-    db = spec.codex_home / "state_5.sqlite"
-    if db.is_file():
-        import sqlite3
-
+    db = find_thread_database(spec.codex_home)
+    if db is not None:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)  # mode=ro so the WAL is honoured
         try:
             rows = dict(
@@ -956,7 +1006,7 @@ def describe_plan(changes: list[Change], gaps: list[Gap]) -> str:
     if same:
         lines.append("\nalready correct:")
         for change in same:
-            lines.append(f"  ok      {change.path}")
+            lines.append(f"  ok      {change.kind} {change.path} — {change.reason}")
     if gaps:
         lines.append("\ngaps needing a human (everything else still proceeds):")
         for gap in gaps:

@@ -1,4 +1,4 @@
 interface:
-  display_name: "Codex Session Guard"
-  short_description: "Audit and preserve sessions across provider switches"
-  default_prompt: "Use $codex-restore-sessions to audit and preserve my local Codex sessions before or after a provider switch."
+  display_name: "Restore Codex Sessions"
+  short_description: "Diagnose and safely restore Codex sessions in one command"
+  default_prompt: "Use $codex-restore-sessions to run a read-only session health check and recommend or perform a guarded restore."

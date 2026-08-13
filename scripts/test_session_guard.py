@@ -20,10 +20,13 @@ SCRIPT = Path(__file__).with_name("session_guard.py")
 def run(home: Path, *args: str) -> dict:
     result = subprocess.run(
         [sys.executable, str(SCRIPT), "--codex-home", str(home), *args],
-        check=True,
         capture_output=True,
         text=True,
     )
+    if result.returncode != 0:
+        raise AssertionError(
+            f"session_guard failed for {args}:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
     return json.loads(result.stdout)
 
 
@@ -44,6 +47,23 @@ def rollout(path: Path, thread_id: str, provider: str) -> None:
 
 
 def main() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        empty_home = Path(raw)
+        empty = run(empty_home, "doctor")
+        assert empty["health"] == "empty", empty
+        orphan = empty_home / "sessions/2026/01/01/rollout-orphan.jsonl"
+        rollout(orphan, "orphan", "openai")
+        blocked = run(empty_home, "doctor")
+        assert blocked["health"] == "blocked", blocked
+        assert blocked["rollout_files_found"] == 1
+
+    with tempfile.TemporaryDirectory() as raw:
+        missing = Path(raw) / "not-created"
+        capabilities = run(missing, "capabilities")
+        assert capabilities["minimum_python"] == "3.9"
+        assert capabilities["codex_home_exists"] is False
+        assert "plan" in capabilities["commands"]
+
     with tempfile.TemporaryDirectory() as raw:
         home = Path(raw)
         active = home / "sessions/2026/01/01/rollout-active.jsonl"
@@ -78,6 +98,21 @@ def main() -> None:
         initial = run(home, "audit")
         assert initial["archived"] == 1
         assert initial["active_visible_estimate"] == 1
+        diagnosed = run(home, "doctor")
+        assert diagnosed["read_only"] is True
+        assert diagnosed["health"] == "action-recommended", diagnosed
+        assert diagnosed["recommendations"][0]["action"] == "restore"
+        assert diagnosed["recommendations"][0]["command"][-1] == "restore"
+        assert "Invalid provider id" in run_fail(
+            home, "restore", "--provider", "../invalid"
+        )
+        assert not (home / "backups").exists(), "invalid input must fail before locking"
+        planned = run(home, "plan")
+        assert planned["safe_to_apply"] is True, planned
+        assert planned["changes"]["database_provider_rows"] == 2
+        assert planned["changes"]["rollout_files"] == 2
+        assert planned["changes"]["rename_rows"] == 1
+        assert not (home / "backups").exists(), "plan must remain read-only"
         compact = run(home, "--compact", "audit")
         assert compact["problems"] == {}
         assert compact["rename_candidate_count"] == 1
@@ -95,6 +130,7 @@ def main() -> None:
         assert sum(path.stat().st_size for path in backup.iterdir()) < 1024 * 1024
         assert backup.stat().st_mode & 0o777 == 0o700
         assert (backup / "state.sqlite").stat().st_mode & 0o777 == 0o600
+        assert run(home, "doctor")["health"] == "healthy"
 
         (home / "config.toml").write_text(
             (home / "config.toml").read_text().replace("relay-a.example", "relay-b.example")
@@ -216,6 +252,13 @@ def check_prune() -> None:
         gone.unlink()
 
         assert run(home, "--compact", "audit")["problems"] == {"stale_database_paths": 1}
+        diagnosis = run(home, "doctor")
+        assert diagnosis["health"] == "blocked"
+        assert diagnosis["recommendations"][0]["action"] == "review-and-prune"
+        assert diagnosis["recommendations"][0]["requires_confirmation"] is True
+        planned = run(home, "plan")
+        assert planned["safe_to_apply"] is False
+        assert "audit:stale_database_paths=1" in planned["blockers"]
         # Stale rows block every other mutating mode until they are pruned.
         assert "Refusing mutation" in run_fail(home, "switch")
         pruned = run(home, "--compact", "prune")
@@ -276,12 +319,14 @@ def check_skip_live() -> None:
             ]
         )
         try:
-            result = run(home, "--compact", "switch", "--provider", "shared", "--skip-live")
+            result = run(home, "--compact", "restore", "--provider", "shared")
         finally:
             appender.terminate()
             appender.wait()
 
-        assert result["deferred_live_sessions"] == [str(busy)], result["deferred_live_sessions"]
+        assert result["deferred_live_sessions"] == [str(busy.resolve())], result[
+            "deferred_live_sessions"
+        ]
         rows = dict(
             sqlite3.connect(home / "state_5.sqlite")
             .execute("select id, model_provider from threads")
@@ -296,7 +341,7 @@ def check_skip_live() -> None:
         assert state.get("deferred_live_sessions") == 1, state
 
         # Once the writer is gone the rerun finishes the job.
-        finished = run(home, "--compact", "switch", "--provider", "shared", "--skip-live")
+        finished = run(home, "--compact", "restore", "--provider", "shared")
         assert finished["deferred_live_sessions"] == []
         rows = dict(
             sqlite3.connect(home / "state_5.sqlite")
@@ -377,12 +422,17 @@ def check_deep_switch() -> None:
         )
         before_one = one.read_text()
 
+        planned = run(home, "plan", "--provider", "shared", "--deep")
+        assert planned["safe_to_apply"] is True, planned
+        assert planned["changes"]["rollout_files"] == 2
+        assert planned["changes"]["rollout_records"] == 7
+
         # A plain switch only fixes the first line, so stale values survive and
         # reindexing would restore the old provider.
         run(home, "--compact", "switch", "--provider", "shared")
         assert providers_in(one) == {"shared", "OpenAI"}, providers_in(one)
 
-        result = run(home, "--compact", "switch", "--provider", "shared", "--deep")
+        result = run(home, "--compact", "restore", "--provider", "shared", "--fail-live")
         assert providers_in(one) == {"shared"}, providers_in(one)
         assert providers_in(two) == {"shared"}, providers_in(two)
 
@@ -502,6 +552,43 @@ def check_migration() -> None:
         )
 
         bundle = root / "bundle"
+
+        nested_bundle = source / "sessions/exported-bundle"
+        assert "outside" in run_fail(source, "export", str(nested_bundle)).lower()
+        assert not nested_bundle.exists()
+
+        # Export preflight rejects links and credential-like files before it
+        # creates a destination or reads the linked target.
+        outside = root / "outside-auth.json"
+        outside.write_text('{"secret":"must-not-be-read"}')
+        leak = source / "sessions/leaked-auth.json"
+        leak.symlink_to(outside)
+        rejected_link = root / "rejected-link-bundle"
+        assert "symlink" in run_fail(source, "export", str(rejected_link)).lower()
+        assert not rejected_link.exists()
+        leak.unlink()
+
+        token_file = source / "sessions/token.json"
+        token_file.write_text('{"secret":"must-not-be-hashed"}')
+        rejected_credential = root / "rejected-credential-bundle"
+        assert "credential" in run_fail(source, "export", str(rejected_credential)).lower()
+        assert not rejected_credential.exists()
+        token_file.unlink()
+
+        unreadable = source / "sessions/unreadable.bin"
+        unreadable.write_bytes(b"not-a-credential")
+        unreadable.chmod(0)
+        failed_copy = root / "failed-copy-bundle"
+        try:
+            assert run_fail(source, "export", str(failed_copy))
+        finally:
+            unreadable.chmod(0o600)
+            unreadable.unlink()
+        assert not failed_copy.exists()
+        assert not list(root.glob(f".{failed_copy.name}.session-guard-*")), (
+            "failed export left a staging directory"
+        )
+
         exported = run(source, "export", str(bundle))
         assert exported["threads"] == 2
         assert sorted(exported["included"]) == [
@@ -516,6 +603,11 @@ def check_migration() -> None:
         verified = verify_only(bundle)
         assert verified["bundle_threads"] == 2
         assert verified["manifest_threads"] == 2
+
+        fake_bundle = root / "fake-bundle"
+        fake_bundle.mkdir()
+        (fake_bundle / "bundle.json").symlink_to(source / "auth.json")
+        assert "not a session bundle" in run_fail(source, "verify", str(fake_bundle)).lower()
 
         # The destination authenticates with its own config, not the source's.
         dest = root / "dest"
@@ -534,7 +626,7 @@ def check_migration() -> None:
         assert rows[0][0] == "active" and rows[0][3] == "kept name"
         assert rows[1][0] == "archived" and rows[1][2] == 1, "archive state must survive"
         for _, path, _, _ in rows:
-            assert Path(path).is_file() and Path(path).is_relative_to(dest), path
+            assert Path(path).is_file() and Path(path).resolve().is_relative_to(dest.resolve()), path
         assert not (dest / "auth.json").exists()
 
         # Importing again would silently merge two histories.
@@ -550,7 +642,7 @@ def check_migration() -> None:
 
 def verify_only(bundle: Path) -> dict:
     result = subprocess.run(
-        [sys.executable, str(SCRIPT), "--codex-home", str(bundle), "verify", str(bundle)],
+        [sys.executable, str(SCRIPT), "verify", str(bundle)],
         check=True,
         capture_output=True,
         text=True,

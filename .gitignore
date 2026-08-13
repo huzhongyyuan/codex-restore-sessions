@@ -4,4 +4,4 @@ __pycache__/
 # Host-specific specs carry internal hostnames and absolute paths.
 # Keep yours outside the repo (e.g. $CODEX_HOME/spec.<host>.toml).
 spec.*.toml
-!reference/spec.example.toml
+!assets/spec.example.toml

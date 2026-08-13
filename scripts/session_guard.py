@@ -10,6 +10,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import sqlite3
@@ -21,8 +22,16 @@ from pathlib import Path
 
 try:
     import tomllib
-except ModuleNotFoundError:  # Python 3.10
-    import tomli as tomllib
+    TOML_BACKEND = "tomllib"
+except ModuleNotFoundError:  # Python 3.9 and 3.10
+    try:
+        import tomli as tomllib
+        TOML_BACKEND = "tomli"
+    except ModuleNotFoundError:
+        raise SystemExit(
+            "Python 3.9+ is required; on Python 3.9/3.10 install the bundled "
+            "requirements.txt (tomli)."
+        )
 
 try:
     import fcntl
@@ -37,15 +46,67 @@ TRANSFER_ITEMS = ("sessions", "archived_sessions", "session_index.jsonl")
 CREDENTIAL_NAMES = {
     "auth.json",
     ".env",
+    ".netrc",
     "credentials.json",
     "provider_keys.env",
+    "secrets.json",
+    "service-account.json",
+    "token.json",
     "id_rsa",
     "id_ed25519",
 }
+CREDENTIAL_SUFFIXES = (".key", ".p12", ".pfx", ".pem")
+
+
+def environment_capabilities(raw_home: str | None) -> dict[str, object]:
+    """Report portable prerequisites without opening a database or mutating state.
+
+    This command deliberately works before a Codex home exists. It gives an agent a
+    stable first step on unfamiliar hosts and makes platform limitations explicit.
+    """
+    home = Path(
+        raw_home or os.environ.get("CODEX_HOME") or (Path.home() / ".codex")
+    ).expanduser().resolve()
+    lock_backend = "fcntl" if fcntl is not None else None
+    databases = sorted(path.name for path in home.glob("state_*.sqlite")) if home.is_dir() else []
+    return {
+        "platform": platform.system() or os.name,
+        "python": platform.python_version(),
+        "minimum_python": "3.9",
+        "toml_backend": TOML_BACKEND,
+        "sqlite": sqlite3.sqlite_version,
+        "lock_backend": lock_backend,
+        "mutation_supported": lock_backend is not None,
+        "codex_home": str(home),
+        "codex_home_exists": home.is_dir(),
+        "config_exists": (home / "config.toml").is_file(),
+        "state_databases": databases,
+        "commands": [
+            "capabilities",
+            "doctor",
+            "audit",
+            "plan",
+            "restore",
+            "switch",
+            "repair",
+            "prune",
+            "unify",
+            "export",
+            "verify",
+            "import",
+            "rollback",
+        ],
+    }
 
 
 def die(message: str) -> None:
     raise SystemExit(message)
+
+
+def validate_provider_id(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", value):
+        die(f"Invalid provider id: {value!r}")
+    return value
 
 
 def sha256(data: bytes) -> str:
@@ -522,6 +583,214 @@ def compact_report(report: dict[str, object]) -> dict[str, object]:
     }
 
 
+def plan_switch(
+    report: dict[str, object],
+    context: dict[str, object],
+    provider: str | None,
+    model: str | None,
+    deep: bool,
+) -> dict[str, object]:
+    """Preview a provider/model synchronization without writing or locking files."""
+    target_provider = validate_provider_id(
+        provider or str(context["target"]["provider"])
+    )
+    rows: list[dict[str, object]] = context["rows"]
+    required = {"id", "rollout_path", "archived", "model_provider", "model", "name"}
+    missing_columns = sorted(required - set(context["columns"]))
+    compact = compact_report(report)
+    blockers = [f"audit:{name}={count}" for name, count in compact["problems"].items()]
+    if missing_columns:
+        blockers.append("schema:missing=" + ",".join(missing_columns))
+
+    provider_rows = sum(str(row.get("model_provider")) != target_provider for row in rows)
+    model_rows = 0 if model is None else sum(row.get("model") != model for row in rows)
+    rename_rows = len(context["rename_candidates"])
+    rollout_files = 0
+    rollout_records = 0
+    for path_string, (_, record, _) in context["metadata"].items():
+        if deep:
+            changes = deep_line_changes(Path(path_string), target_provider)
+            if changes:
+                rollout_files += 1
+                rollout_records += len(changes)
+        elif record["payload"].get("model_provider") != target_provider:
+            rollout_files += 1
+            rollout_records += 1
+
+    return {
+        "safe_to_apply": not blockers,
+        "blockers": blockers,
+        "target": {
+            "provider": target_provider,
+            "model": model,
+            "profile": context["target"]["profile"],
+            "deep": deep,
+        },
+        "changes": {
+            "database_provider_rows": provider_rows,
+            "database_model_rows": model_rows,
+            "rename_rows": rename_rows,
+            "rollout_files": rollout_files,
+            "rollout_records": rollout_records,
+            "state_fingerprint": (
+                context["previous_scope"].get("fingerprint")
+                != context["target"]["fingerprint"]
+            ),
+        },
+        "audit": compact,
+    }
+
+
+def doctor_report(
+    home: Path,
+    report: dict[str, object],
+    context: dict[str, object],
+    provider: str | None,
+) -> dict[str, object]:
+    """Turn a read-only audit into a stable health verdict and next action."""
+    plan = plan_switch(report, context, provider, None, True)
+    compact = plan["audit"]
+    profile = context["target"]["profile"]
+    prefix = [
+        "python3",
+        "scripts/session_guard.py",
+        "--codex-home",
+        str(home),
+    ]
+    if profile:
+        prefix.extend(["--profile", str(profile)])
+    prefix.append("--compact")
+    recommendations: list[dict[str, object]] = []
+    problems: dict[str, int] = compact["problems"]
+
+    if problems:
+        if set(problems) == {"stale_database_paths"}:
+            recommendations.append(
+                {
+                    "action": "review-and-prune",
+                    "reason": (
+                        f"{problems['stale_database_paths']} database row(s) point to "
+                        "rollout files that no longer exist"
+                    ),
+                    "command": prefix + ["prune"],
+                    "mutates": True,
+                    "requires_confirmation": True,
+                }
+            )
+        if "unindexed_rollout_files" in problems:
+            recommendations.append(
+                {
+                    "action": "reindex-with-codex",
+                    "reason": (
+                        f"{problems['unindexed_rollout_files']} rollout file(s) exist but are "
+                        "not indexed; prune cannot repair this direction"
+                    ),
+                    "command": None,
+                    "mutates": False,
+                    "requires_confirmation": False,
+                }
+            )
+        if not recommendations or set(problems) - {
+            "stale_database_paths",
+            "unindexed_rollout_files",
+        }:
+            recommendations.append(
+                {
+                    "action": "inspect-audit-blockers",
+                    "reason": "Integrity blockers must be resolved before any automated mutation",
+                    "command": prefix[:-1] + ["--verbose", "audit"],
+                    "mutates": False,
+                    "requires_confirmation": False,
+                }
+            )
+        health = "blocked"
+        summary = "Session state has integrity blockers; automated restore is disabled."
+    else:
+        changes: dict[str, object] = plan["changes"]
+        provider_changes = bool(
+            changes["database_provider_rows"] or changes["rollout_records"]
+        )
+        config_drift = bool(
+            report["previous_fingerprint_known"] and report["provider_or_relay_changed"]
+        )
+        rename_changes = bool(changes["rename_rows"])
+        if provider_changes or config_drift:
+            command = prefix + ["restore"]
+            if provider:
+                command.extend(["--provider", provider])
+            recommendations.append(
+                {
+                    "action": "restore",
+                    "reason": "Provider metadata or the configured relay differs from session state",
+                    "command": command,
+                    "mutates": True,
+                    "requires_confirmation": False,
+                }
+            )
+        elif rename_changes:
+            recommendations.append(
+                {
+                    "action": "repair-names",
+                    "reason": f"{changes['rename_rows']} unambiguous legacy name(s) can be restored",
+                    "command": prefix + ["repair"],
+                    "mutates": True,
+                    "requires_confirmation": False,
+                }
+            )
+
+        if recommendations and fcntl is None:
+            health = "blocked"
+            summary = "A repair is recommended, but guarded mutation is unsupported on this platform."
+        elif recommendations:
+            health = "action-recommended"
+            summary = "Session state is internally consistent, but a guarded repair is recommended."
+        elif report["ambiguous_rename_count"]:
+            health = "warning"
+            summary = "Session state is healthy; ambiguous legacy names were left unchanged."
+        else:
+            health = "healthy"
+            summary = "Session database and rollout files are consistent with the configured provider."
+
+    for recommendation in recommendations:
+        recommendation["auto_execute"] = False
+    return {
+        "read_only": True,
+        "recommendations_are_advisory": True,
+        "health": health,
+        "summary": summary,
+        "mutation_supported": fcntl is not None,
+        "recommendations": recommendations,
+        "plan": plan,
+    }
+
+
+def unavailable_doctor_report(home: Path, error: str) -> dict[str, object]:
+    """Return a useful read-only verdict when a normal audit cannot start."""
+    capabilities = environment_capabilities(str(home))
+    rollouts = [
+        path
+        for folder in (home / "sessions", home / "archived_sessions")
+        if folder.exists()
+        for path in folder.rglob("rollout-*.jsonl")
+    ]
+    empty = not capabilities["state_databases"] and not rollouts
+    return {
+        "read_only": True,
+        "recommendations_are_advisory": True,
+        "health": "empty" if empty else "blocked",
+        "summary": (
+            "This Codex home contains no session database or rollout files."
+            if empty
+            else "Session state exists, but a normal audit could not start."
+        ),
+        "mutation_supported": capabilities["mutation_supported"],
+        "diagnostic_error": error,
+        "recommendations": [],
+        "capabilities": capabilities,
+        "rollout_files_found": len(rollouts),
+    }
+
+
 def require_mutation_schema(context: dict[str, object]) -> None:
     required = {"id", "rollout_path", "archived", "model_provider", "model", "name"}
     missing = sorted(required - set(context["columns"]))
@@ -827,6 +1096,8 @@ def apply_changes(
     deep: bool = False,
 ) -> Path | None:
     require_mutation_schema(context)
+    if provider is not None:
+        provider = validate_provider_id(provider)
     skip_paths = skip_paths or set()
     skipped_ids = {
         str(row["id"])
@@ -1378,9 +1649,49 @@ def prune(home: Path, context: dict[str, object], report: dict[str, object]) -> 
 
 def assert_no_credentials(names: list[str]) -> None:
     for name in names:
-        base = Path(name).name
-        if base in CREDENTIAL_NAMES or base.startswith("auth.json"):
+        base = Path(name).name.lower()
+        if (
+            base in CREDENTIAL_NAMES
+            or base.startswith(("auth.json", ".env."))
+            or base.endswith(CREDENTIAL_SUFFIXES)
+        ):
             die(f"Refusing to include a credential file in a bundle: {name}")
+
+
+def preflight_transfer_sources(home: Path) -> list[str]:
+    """Reject links, special files, and credential-like names before creating output."""
+    entries = []
+    for name in TRANSFER_ITEMS:
+        source = home / name
+        if not source.exists() and not source.is_symlink():
+            continue
+        if source.is_symlink():
+            die(f"Refusing to export a symlinked transfer item: {source}")
+        candidates = [source]
+        if source.is_dir():
+            candidates.extend(source.rglob("*"))
+        for path in candidates:
+            relative = str(path.relative_to(home))
+            if path.is_symlink():
+                die(f"Refusing to export a symlink from session state: {relative}")
+            if not path.is_dir() and not path.is_file():
+                die(f"Refusing to export a special file from session state: {relative}")
+            entries.append(relative)
+    assert_no_credentials(entries)
+    return entries
+
+
+def require_rollouts_unchanged(context: dict[str, object]) -> None:
+    """Fail an export if any audited rollout changed while the bundle was built."""
+    for path_string, (_, _, expected) in context["metadata"].items():
+        path = Path(path_string)
+        try:
+            stat = path.stat()
+        except OSError:
+            die(f"Rollout vanished during export: {path}")
+        current = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        if current != expected:
+            die(f"Rollout changed during export; stop the active session and retry: {path}")
 
 
 def export_bundle(home: Path, destination: Path, profile: str | None) -> dict[str, object]:
@@ -1393,61 +1704,91 @@ def export_bundle(home: Path, destination: Path, profile: str | None) -> dict[st
     """
     report, context = audit(home, profile=profile)
     require_clean(report)
-    if destination.exists():
+    if destination.exists() or destination.is_symlink():
         die(f"Export destination already exists: {destination}")
-    destination.mkdir(parents=True, mode=0o700)
-    os.chmod(destination, 0o700)
+    if destination.resolve().is_relative_to(home):
+        die("Export destination must be outside the source Codex home")
+    preflight_transfer_sources(home)
+    live = live_rollouts(context)
+    if live:
+        die(
+            "Refusing export while rollout files are actively growing: "
+            + ", ".join(sorted(live))
+        )
 
-    payload = destination / "codex_home"
-    payload.mkdir(mode=0o700)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(
+        tempfile.mkdtemp(
+            prefix=f".{destination.name}.session-guard-", dir=destination.parent
+        )
+    )
+    os.chmod(staging, 0o700)
     copied = []
-    for name in TRANSFER_ITEMS:
-        source = home / name
-        if not source.exists():
-            continue
-        target = payload / name
-        if source.is_dir():
-            shutil.copytree(source, target, symlinks=False, ignore_dangling_symlinks=False)
-        else:
-            shutil.copy2(source, target)
-        copied.append(name)
-    assert_no_credentials([str(path.relative_to(payload)) for path in payload.rglob("*")])
+    try:
+        payload = staging / "codex_home"
+        payload.mkdir(mode=0o700)
+        for name in TRANSFER_ITEMS:
+            source = home / name
+            if not source.exists():
+                continue
+            target = payload / name
+            if source.is_dir():
+                shutil.copytree(source, target, symlinks=True)
+            else:
+                shutil.copy2(source, target)
+            copied.append(name)
 
-    source_con = sqlite3.connect(context["db"])
-    snapshot = sqlite3.connect(destination / "state.sqlite")
-    source_con.backup(snapshot)
-    snapshot.close()
-    source_con.close()
-    os.chmod(destination / "state.sqlite", 0o600)
-    check_con = sqlite3.connect(destination / "state.sqlite")
-    check = check_con.execute("pragma integrity_check").fetchone()[0]
-    check_con.close()
-    if check != "ok":
-        die(f"Exported database integrity_check failed: {check}")
+        source_con = sqlite3.connect(f"file:{context['db']}?mode=ro", uri=True)
+        snapshot = sqlite3.connect(staging / "state.sqlite")
+        try:
+            source_con.backup(snapshot)
+        finally:
+            snapshot.close()
+            source_con.close()
+        os.chmod(staging / "state.sqlite", 0o600)
+        check_con = sqlite3.connect(staging / "state.sqlite")
+        try:
+            check = check_con.execute("pragma integrity_check").fetchone()[0]
+        finally:
+            check_con.close()
+        if check != "ok":
+            die(f"Exported database integrity_check failed: {check}")
 
-    digests = {
-        str(path.relative_to(destination)): sha256_file(path)
-        for path in sorted(destination.rglob("*"))
-        if path.is_file()
-    }
-    manifest = {
-        "version": 1,
-        "kind": "session-bundle",
-        "created_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "source_codex_home": str(home),
-        "source_database": Path(str(context["db"])).name,
-        "threads": report["threads"],
-        "active": report["active"],
-        "archived": report["archived"],
-        "rollout_files": report["rollout_files"],
-        "jsonl_providers": report["jsonl_providers"],
-        "database_providers": report["database_providers"],
-        "source_provider": context["target"]["provider"],
-        "source_profile": context["target"]["profile"],
-        "included": copied,
-        "digests": digests,
-    }
-    write_json(destination / "bundle.json", manifest)
+        require_rollouts_unchanged(context)
+        # Repeat the link/credential scan on the staged copy before hashing. This
+        # closes the race where a source entry changes after the first preflight.
+        preflight_transfer_sources(payload)
+        digests = {
+            str(path.relative_to(staging)): sha256_file(path)
+            for path in sorted(staging.rglob("*"))
+            if path.is_file()
+        }
+        manifest = {
+            "version": 1,
+            "kind": "session-bundle",
+            "created_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "source_codex_home": str(home),
+            "source_database": Path(str(context["db"])).name,
+            "threads": report["threads"],
+            "active": report["active"],
+            "archived": report["archived"],
+            "rollout_files": report["rollout_files"],
+            "jsonl_providers": report["jsonl_providers"],
+            "database_providers": report["database_providers"],
+            "source_provider": context["target"]["provider"],
+            "source_profile": context["target"]["profile"],
+            "included": copied,
+            "digests": digests,
+        }
+        write_json(staging / "bundle.json", manifest)
+        verify_bundle(staging)
+        require_rollouts_unchanged(context)
+        if destination.exists():
+            die(f"Export destination appeared during export: {destination}")
+        staging.rename(destination)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
     return {
         "bundle": str(destination),
         "threads": report["threads"],
@@ -1459,8 +1800,16 @@ def export_bundle(home: Path, destination: Path, profile: str | None) -> dict[st
 
 def verify_bundle(bundle: Path) -> dict[str, object]:
     manifest_path = bundle / "bundle.json"
-    if not manifest_path.is_file():
+    if manifest_path.is_symlink() or not manifest_path.is_file():
         die(f"Not a session bundle (missing bundle.json): {bundle}")
+    entries = list(bundle.rglob("*"))
+    assert_no_credentials([str(path.relative_to(bundle)) for path in entries])
+    for path in entries:
+        relative = path.relative_to(bundle)
+        if path.is_symlink():
+            die(f"Bundle contains a symlink: {relative}")
+        if not path.is_dir() and not path.is_file():
+            die(f"Bundle contains a special file: {relative}")
     manifest = json.loads(manifest_path.read_text())
     if not isinstance(manifest, dict) or manifest.get("kind") != "session-bundle":
         die("Unsupported or malformed bundle manifest")
@@ -1581,9 +1930,10 @@ def rebase_paths(home: Path, context: dict[str, object], manifest: dict[str, obj
     when the translated path resolves to a real file inside this home, so a
     genuinely missing session still surfaces as stale.
     """
-    source_home = str(manifest.get("source_codex_home") or "").rstrip("/")
-    if not source_home:
+    source_home_text = str(manifest.get("source_codex_home") or "").rstrip("/")
+    if not source_home_text:
         die("Bundle does not record its source Codex home; cannot rebase paths")
+    source_home = Path(source_home_text).resolve()
     con = sqlite3.connect(context["db"], timeout=5)
     changed = 0
     try:
@@ -1593,9 +1943,22 @@ def rebase_paths(home: Path, context: dict[str, object], manifest: dict[str, obj
             current = resolve_rollout(home, raw)
             if current.is_relative_to(home) and current.is_file():
                 continue
-            if not raw.startswith(source_home + "/"):
-                continue
-            candidate = home / raw[len(source_home) + 1 :]
+            relative = None
+            raw_path = Path(raw)
+            if raw_path.is_absolute():
+                # macOS exposes the same temporary tree as both /var/... and
+                # /private/var/.... Resolve existing source paths before comparing
+                # so a portable bundle does not preserve that spelling accident.
+                try:
+                    relative = raw_path.resolve().relative_to(source_home)
+                except ValueError:
+                    relative = None
+            if relative is None:
+                try:
+                    relative = raw_path.relative_to(Path(source_home_text))
+                except ValueError:
+                    continue
+            candidate = home / relative
             resolved = candidate.resolve()
             if not resolved.is_relative_to(home) or not resolved.is_file():
                 continue
@@ -1617,7 +1980,7 @@ def rebase_paths(home: Path, context: dict[str, object], manifest: dict[str, obj
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--codex-home")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--compact", action="store_true")
@@ -1627,7 +1990,23 @@ def parse_args() -> argparse.Namespace:
         "matching `codex -p <name>`",
     )
     sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser(
+        "capabilities",
+        help="Report runtime/platform support without requiring an existing Codex home",
+    )
+    doctor = sub.add_parser(
+        "doctor", help="Read-only health verdict with a structured recommended next action"
+    )
+    doctor.add_argument("--provider", help="Preview health against an explicit provider id")
     sub.add_parser("audit")
+    plan = sub.add_parser("plan", help="Preview a switch without writing any files")
+    plan.add_argument("--provider")
+    plan.add_argument("--model", help="Preview an explicit historical model rewrite")
+    plan.add_argument(
+        "--deep",
+        action="store_true",
+        help="Count every provider-bearing rollout record, not only the first header",
+    )
     switch = sub.add_parser("switch")
     switch.add_argument("--provider")
     switch.add_argument("--model", help="Explicitly rewrite historical thread model metadata")
@@ -1643,6 +2022,17 @@ def parse_args() -> argparse.Namespace:
         help="Also rewrite repeated session_meta records and "
         "thread_settings.model_provider_id, which reindexing otherwise reads to "
         "restore the old provider",
+    )
+    restore = sub.add_parser(
+        "restore",
+        help="Guarded one-command restore: deep provider repair and live-session deferral",
+    )
+    restore.add_argument("--provider")
+    restore.add_argument("--model", help="Explicitly rewrite historical thread model metadata")
+    restore.add_argument(
+        "--fail-live",
+        action="store_true",
+        help="Fail on concurrent rollout writes instead of deferring actively growing sessions",
     )
     unify_parser = sub.add_parser(
         "unify",
@@ -1666,12 +2056,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    home = resolve_home(args.codex_home)
-    profile = getattr(args, "profile", None)
-
+    if args.command == "capabilities":
+        print(json.dumps(environment_capabilities(args.codex_home), ensure_ascii=False, indent=2))
+        return
     if args.command == "verify":
         print(json.dumps(verify_bundle(Path(args.bundle).resolve()), ensure_ascii=False, indent=2))
         return
+    home = resolve_home(args.codex_home)
+    profile = getattr(args, "profile", None)
 
     if args.command == "export":
         with mutation_lock(home):
@@ -1698,7 +2090,30 @@ def main() -> None:
         print(json.dumps(compact_report(report) if args.compact else report, ensure_ascii=False, indent=2))
         return
 
+    if args.command == "doctor":
+        try:
+            report, context = audit(home, args.verbose, profile)
+            result = doctor_report(home, report, context, args.provider)
+        except (SystemExit, OSError, sqlite3.Error, ValueError) as exc:
+            print(
+                json.dumps(
+                    unavailable_doctor_report(home, str(exc)),
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.command == "plan":
+        report, context = audit(home, args.verbose, profile)
+        result = plan_switch(report, context, args.provider, args.model, args.deep)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
     if args.command == "unify":
+        validate_provider_id(args.provider)
         with mutation_lock(home):
             result = unify(home, args.provider, args.skip_live)
         if args.compact:
@@ -1706,6 +2121,8 @@ def main() -> None:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
 
+    if args.command in {"switch", "restore"} and args.provider:
+        validate_provider_id(args.provider)
     with mutation_lock(home):
         report, context = audit(home, args.verbose, profile)
         skip: set[str] = set()
@@ -1713,12 +2130,15 @@ def main() -> None:
             backup = prune(home, context, report)
         else:
             require_clean(report)
-            if args.command == "switch":
+            if args.command in {"switch", "restore"}:
                 provider = args.provider or str(context["target"]["provider"])
-                if getattr(args, "skip_live", False):
+                if args.command == "restore" and not args.fail_live:
                     skip = live_rollouts(context)
+                elif getattr(args, "skip_live", False):
+                    skip = live_rollouts(context)
+                deep = True if args.command == "restore" else args.deep
                 backup = apply_changes(
-                    home, context, provider, args.model, True, "switch", skip, args.deep
+                    home, context, provider, args.model, True, "switch", skip, deep
                 )
             else:
                 backup = apply_changes(home, context, None, None, True, "repair")

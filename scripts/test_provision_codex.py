@@ -138,7 +138,10 @@ def check_idempotent(root: Path) -> None:
         "base": (home / "config.toml").read_text(),
         "rc": (root / "bashrc").read_text(),
     }
-    run(["apply", "--spec", str(spec), "--migrator", "/nonexistent/x.py"])
+    second = json.loads(
+        run(["apply", "--spec", str(spec), "--migrator", "/nonexistent/x.py"])
+    )
+    assert second["backup_dir"] is None, "no-op apply must not create an empty backup"
     assert (home / "relay.config.toml").read_text() == snapshot["relay"], "profile drifted"
     assert (home / "config.toml").read_text() == snapshot["base"], "base config drifted"
     rc = (root / "bashrc").read_text()
@@ -147,6 +150,19 @@ def check_idempotent(root: Path) -> None:
     plan = run(["plan", "--spec", str(spec)])
     assert "0 change(s) to apply" in plan or "already correct" in plan, plan
     print("  re-running is idempotent; wrappers are not duplicated")
+
+
+def check_template_has_safe_timeless_defaults(root: Path) -> None:
+    del root
+    template = HERE.parent / "assets" / "spec.example.toml"
+    with template.open("rb") as stream:
+        data = tomllib.load(stream)
+    assert data["approval_policy"] == "on-request"
+    assert data["sandbox_mode"] == "workspace-write"
+    assert data["trusted_projects"] == []
+    assert "model" not in data["official"]
+    assert all("model" not in provider for provider in data["providers"])
+    print("  template defaults are safe and do not pin a model version")
 
 
 def check_reserved_id_rejected(root: Path) -> None:
@@ -179,6 +195,27 @@ def check_loose_key_mode_flagged(root: Path) -> None:
     print("  world-readable key file is flagged")
 
 
+def check_unreadable_key_mode_flagged(root: Path) -> None:
+    home = fake_home(root)
+    spec = write_spec(root, home)
+    keyfile = root / "keys" / "relay" / "auth.json"
+    os.chmod(keyfile, 0o200)
+    out = run(["plan", "--spec", str(spec)])
+    assert "not owner-readable" in out, out
+    print("  non-readable key file mode is flagged without opening it")
+
+
+def check_key_contents_are_not_opened(root: Path) -> None:
+    home = fake_home(root)
+    spec = write_spec(root, home)
+    keyfile = root / "keys" / "relay" / "auth.json"
+    keyfile.write_text("opaque-to-the-provisioner\n")
+    os.chmod(keyfile, 0o600)
+    out = run(["plan", "--spec", str(spec)])
+    assert "not readable JSON" not in out and "lacks OPENAI_API_KEY" not in out, out
+    print("  credential contents are not opened during plan")
+
+
 def check_codex_api_key_rejected(root: Path) -> None:
     home = fake_home(root)
     spec = root / "bad.toml"
@@ -199,6 +236,20 @@ def check_symlink_opt_out(root: Path) -> None:
     out = run(["plan", "--spec", str(spec)])
     assert "symlink" not in out, f"link_home=false still planned a symlink:\n{out}"
     print("  link_home = false suppresses the $HOME/.codex symlink")
+
+
+def check_shell_rc_alias(root: Path) -> None:
+    home = fake_home(root)
+    spec = write_spec(root, home)
+    text = spec.read_text().replace(
+        f'bashrc = "{root / "bashrc"}"', f'shell_rc = "{root / "zshrc"}"'
+    )
+    spec.write_text(text)
+    run(["apply", "--spec", str(spec), "--migrator", "/nonexistent/x.py"])
+    assert (root / "zshrc").is_file()
+    assert "codex-relay()" in (root / "zshrc").read_text()
+    assert not (root / "bashrc").exists()
+    print("  shell_rc supports Bash/zsh startup files; legacy bashrc still works")
 
 
 def check_symlink_never_stolen(root: Path) -> None:
@@ -283,11 +334,15 @@ def main() -> int:
         check_plan_is_readonly,
         check_apply,
         check_idempotent,
+        check_template_has_safe_timeless_defaults,
         check_reserved_id_rejected,
         check_missing_key_is_a_gap,
         check_loose_key_mode_flagged,
+        check_unreadable_key_mode_flagged,
+        check_key_contents_are_not_opened,
         check_codex_api_key_rejected,
         check_symlink_opt_out,
+        check_shell_rc_alias,
         check_symlink_never_stolen,
         check_stray_key_rejected,
         check_passthrough_table,
